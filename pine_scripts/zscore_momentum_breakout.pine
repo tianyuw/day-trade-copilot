@@ -1,0 +1,61 @@
+//@version=5
+indicator("Z-Score Momentum Breakout", overlay=false)
+
+// --- Inputs ---
+// 默认使用当前图表商品 (syminfo.tickerid)
+// 如果用户想强制指定其他标的（比如在 SPY 图上看 IWM 信号），可以在设置里修改，否则留空或默认即为当前图表
+ticker = input.symbol("", "Target Symbol (Empty for Current)")
+
+// 获取实际要计算的 ticker ID
+// 如果用户输入了特定的 symbol，就用用户的；如果是空字符串，就用当前图表的 ticker
+calc_ticker = ticker == "" ? syminfo.tickerid : ticker
+
+// 统计周期（天）
+lookback_days = input.int(30, "Lookback Days (Days)")
+// 阈值
+threshold = input.float(0.1, "Threshold")
+
+// --- 1. 计算均值 (A) 和 标准差 (B) ---
+// 需求：过去 30 天盘中价格的均值和标准差。
+// 实现思路：
+// 直接在盘中(Intraday)回溯过去 30 天的所有 K 线计算量非常大（例如 1分钟 K 线 30天约 11700 根），
+// 且容易超出 Pine Script 的计算限制。
+// 因此，这里采用 "日线级别" 的统计数据作为近似值，这也是量化交易中常用的处理方式。
+// A = 过去 30 天日收盘价的移动平均 (SMA)
+// B = 过去 30 天日收盘价的标准差 (StDev)
+daily_mean = request.security(calc_ticker, "D", ta.sma(close, lookback_days))
+daily_stdev = request.security(calc_ticker, "D", ta.stdev(close, lookback_days))
+
+// --- 2. 计算 Z-Score ---
+// Z-Score = (当前价格 - 均值) / 标准差
+// 注意：这里的 close 是当前图表周期的收盘价
+z_score = (close - daily_mean) / daily_stdev
+
+// --- 3. 计算 Diff ---
+// diff = ema5(t) - ema5(t-1)
+// 这里是对 z-score 进行 EMA5 平滑
+ema_z = ta.ema(z_score, 5)
+// 引用 1 根 K 线前的 ema 值
+ema_z_prev = ema_z[1]
+
+diff = ema_z - ema_z_prev
+
+// --- 4. 标记信号 ---
+// 如果 diff > 阈值，且上一根 K 线的 diff <= 阈值，则视为起始点
+is_signal_start = diff > threshold and diff[1] <= threshold
+
+// --- 5. 绘图与可视化 ---
+// 绘制 Diff 曲线
+plot(diff, "Diff Value", color=color.blue, linewidth=2)
+
+// 绘制阈值线
+hline(threshold, "Threshold", color=color.red, linestyle=hline.style_dashed)
+
+// 当触发信号起始点时，改变背景颜色
+bgcolor(is_signal_start ? color.new(color.green, 50) : na)
+
+// 当触发信号起始点时，改变主图 K 线颜色
+barcolor(is_signal_start ? color.green : color.gray)
+
+// 辅助绘图
+plot(z_score, "Z-Score (Hidden)", display=display.none)

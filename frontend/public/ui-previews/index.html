@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>0DTE Copilot — UI Previews</title>
+    <style>
+      :root {
+        --bg0: #05050a;
+        --bg1: rgba(255, 255, 255, 0.06);
+        --ring: rgba(255, 255, 255, 0.1);
+        --text: rgba(255, 255, 255, 0.92);
+        --muted: rgba(255, 255, 255, 0.62);
+        --cyan: #22d3ee;
+        --violet: #8b5cf6;
+        --amber: #fbbf24;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        color: var(--text);
+        background: radial-gradient(1200px circle at 20% 10%, rgba(124, 58, 237, 0.35), transparent 55%),
+          radial-gradient(900px circle at 80% 30%, rgba(34, 211, 238, 0.25), transparent 45%),
+          radial-gradient(900px circle at 50% 90%, rgba(251, 191, 36, 0.18), transparent 40%), var(--bg0);
+      }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        backdrop-filter: blur(14px);
+        background: rgba(0, 0, 0, 0.35);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .wrap {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 16px 18px;
+      }
+      .title {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .title h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+      }
+      .title .meta {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, 375px);
+        gap: 18px;
+        padding: 18px;
+        overflow-x: auto;
+      }
+      .artboard {
+        width: 375px;
+        height: 812px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 46px;
+        padding: 14px;
+        background: rgba(255, 255, 255, 0.05);
+        box-shadow: inset 10px 10px 22px rgba(0, 0, 0, 0.55), inset -10px -10px 22px rgba(255, 255, 255, 0.07),
+          0 20px 60px rgba(0, 0, 0, 0.55);
+        position: relative;
+      }
+      .screen {
+        height: 100%;
+        width: 100%;
+        border-radius: 34px;
+        overflow: hidden;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.09);
+      }
+      .topbar {
+        padding: 16px 16px 12px 16px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(12px);
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12) inset;
+        font-size: 11px;
+        font-weight: 700;
+        color: rgba(255, 255, 255, 0.84);
+      }
+      .pill svg {
+        width: 14px;
+        height: 14px;
+        color: var(--cyan);
+      }
+      .hero {
+        padding: 0 16px 10px 16px;
+      }
+      .hero h2 {
+        margin: 0;
+        font-size: 26px;
+        font-weight: 950;
+        letter-spacing: -0.03em;
+      }
+      .hero h2 span {
+        display: block;
+        background: linear-gradient(90deg, rgba(34, 211, 238, 0.95), rgba(139, 92, 246, 0.95), rgba(251, 191, 36, 0.95));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero p {
+        margin: 10px 0 0 0;
+        color: var(--muted);
+        line-height: 1.45;
+        font-size: 12.5px;
+      }
+      .cta {
+        margin-top: 14px;
+        display: flex;
+        gap: 10px;
+      }
+      .btn {
+        padding: 11px 14px;
+        border-radius: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.88);
+        font-weight: 800;
+        font-size: 12px;
+        position: relative;
+        overflow: hidden;
+      }
+      .btn::before {
+        content: "";
+        position: absolute;
+        inset: -20px;
+        background: linear-gradient(90deg, rgba(34, 211, 238, 0.25), rgba(139, 92, 246, 0.25), rgba(251, 191, 36, 0.18));
+        filter: blur(16px);
+        opacity: 0.9;
+      }
+      .btn span {
+        position: relative;
+      }
+      .btn.secondary::before {
+        opacity: 0.45;
+      }
+      .cards {
+        padding: 14px 16px 16px 16px;
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+      }
+      .card {
+        border-radius: 22px;
+        padding: 12px 12px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(14px);
+        box-shadow: inset 10px 10px 18px rgba(0, 0, 0, 0.55), inset -10px -10px 18px rgba(255, 255, 255, 0.06);
+        transition: filter 200ms ease, transform 200ms ease;
+      }
+      .card:hover {
+        transform: translateY(-1px);
+        filter: drop-shadow(0 0 18px rgba(139, 92, 246, 0.45));
+      }
+      .card .k {
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.58);
+        font-weight: 800;
+      }
+      .card .v {
+        margin-top: 6px;
+        font-weight: 950;
+        letter-spacing: -0.02em;
+      }
+      .chart {
+        margin: 10px 16px 16px 16px;
+        border-radius: 26px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .chart svg {
+        display: block;
+        width: 100%;
+        height: 220px;
+      }
+      .dashline {
+        stroke-dasharray: 240;
+        stroke-dashoffset: 240;
+        animation: dash 1.6s ease-out forwards;
+      }
+      @keyframes dash {
+        to {
+          stroke-dashoffset: 0;
+        }
+      }
+      .thumb {
+        height: 210px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .thumb svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .label {
+        position: absolute;
+        left: 24px;
+        top: 22px;
+        padding: 7px 10px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        font-size: 11px;
+        font-weight: 900;
+        color: rgba(255, 255, 255, 0.82);
+      }
+    </style>
+  </head>
+  <body>
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true" focusable="false">
+      <symbol id="icon-bolt" viewBox="0 0 24 24">
+        <path d="M13 2L3 14h7l-1 8 12-14h-7l-1-6z" fill="currentColor"></path>
+      </symbol>
+      <symbol id="icon-fire" viewBox="0 0 24 24">
+        <path
+          d="M12 22c4.4 0 8-3.4 8-7.7 0-3.6-2.4-5.7-4.2-7.3-.9-.8-1.6-1.5-2-2.2-.3.9-.8 1.7-1.5 2.4-.9.9-2 1.8-2 3.2 0 1.6 1.3 2.7 2.8 2.7 1.6 0 2.9-1.2 2.9-2.8 1.8 1.4 3 3.1 3 5.1 0 3.3-2.8 6-6.2 6-3.5 0-6.3-2.7-6.3-6 0-4.3 3.3-6.4 4.8-9.9.6 1.8 1.9 3 3.3 4.2 1.9 1.7 3.9 3.4 3.9 6.6 0 4.3-3.6 7.7-8 7.7z"
+          fill="currentColor"
+        ></path>
+      </symbol>
+      <symbol id="icon-spark" viewBox="0 0 24 24">
+        <path
+          d="M3 14l4-4 4 4 6-8 4 4"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        ></path>
+      </symbol>
+    </svg>
+
+    <header>
+      <div class="wrap title">
+        <h1>0DTE Copilot — UI Previews</h1>
+        <div class="meta">4 artboards/row • 375×812 • neumorphism + glass</div>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="artboard">
+        <div class="label">Landing</div>
+        <div class="screen">
+          <div class="topbar">
+            <div class="pill">
+              <svg aria-hidden="true"><use href="#icon-bolt"></use></svg>
+              Quant → AI → Action
+            </div>
+            <div class="pill">
+              <svg style="color: var(--amber)" aria-hidden="true"><use href="#icon-spark"></use></svg>
+              vibe check
+            </div>
+          </div>
+          <div class="hero">
+            <h2>
+              Trade the minute.
+              <span>0DTE Copilot.</span>
+            </h2>
+            <p>回放复盘 + 实时监控。霓虹、玻璃、微交互。Everything feels instant.</p>
+            <div class="cta">
+              <button class="btn"><span>Enter Dashboard</span></button>
+              <button class="btn secondary"><span>See Previews</span></button>
+            </div>
+          </div>
+          <div class="cards">
+            <div class="card">
+              <div class="k">Playback</div>
+              <div class="v">复盘回放</div>
+            </div>
+            <div class="card">
+              <div class="k">Realtime</div>
+              <div class="v">实时推送</div>
+            </div>
+            <div class="card">
+              <div class="k">Grid</div>
+              <div class="v">网格监控</div>
+            </div>
+            <div class="card">
+              <div class="k">Neon</div>
+              <div class="v">霓虹质感</div>
+            </div>
+          </div>
+          <div class="chart">
+            <svg viewBox="0 0 320 220">
+              <defs>
+                <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+                  <stop offset="0" stop-color="rgba(34,211,238,.95)"></stop>
+                  <stop offset="0.5" stop-color="rgba(139,92,246,.95)"></stop>
+                  <stop offset="1" stop-color="rgba(251,191,36,.9)"></stop>
+                </linearGradient>
+              </defs>
+              <path
+                d="M8 156 C 24 118, 40 184, 62 132 S 108 90, 134 116 S 182 174, 210 112 S 268 80, 312 114"
+                fill="none"
+                stroke="url(#g)"
+                stroke-width="3"
+                class="dashline"
+              ></path>
+              <path d="M8 192H312" stroke="rgba(255,255,255,.08)" />
+              <path d="M8 22H312" stroke="rgba(255,255,255,.06)" />
+            </svg>
+          </div>
+        </div>
+      </section>
+
+      <section class="artboard">
+        <div class="label">Dashboard • Grid</div>
+        <div class="screen">
+          <div class="topbar">
+            <div class="pill">
+              <svg style="color: var(--violet)" aria-hidden="true"><use href="#icon-fire"></use></svg>
+              AI verified
+            </div>
+            <div class="pill">
+              <svg aria-hidden="true"><use href="#icon-bolt"></use></svg>
+              Playback
+            </div>
+          </div>
+          <div style="padding: 0 16px 12px 16px">
+            <div style="font-size: 12px; font-weight: 900; color: rgba(255,255,255,.78)">6 charts • 3 columns</div>
+            <div style="margin-top: 6px; font-size: 11px; color: rgba(255,255,255,.58)">
+              Cards hover glow + glass blur. Sparkline anim is dasharray.
+            </div>
+          </div>
+          <div style="padding: 0 16px 16px 16px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px">
+            <div class="card" style="height: 140px">
+              <div class="k">META</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(34,211,238,.8)">
+                <path d="M4 34 C 18 16, 32 44, 48 26 S 82 14, 102 24 S 132 40, 156 16" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+            <div class="card" style="height: 140px">
+              <div class="k">NVDA</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(139,92,246,.85)">
+                <path d="M4 28 C 18 10, 32 40, 50 22 S 96 12, 118 26 S 138 44, 156 20" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+            <div class="card" style="height: 140px">
+              <div class="k">TSM</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(251,191,36,.8)">
+                <path d="M4 32 C 18 14, 34 44, 52 24 S 92 18, 114 22 S 142 36, 156 18" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+            <div class="card" style="height: 140px">
+              <div class="k">AAPL</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(34,211,238,.75)">
+                <path d="M4 30 C 20 18, 34 42, 52 20 S 92 10, 114 26 S 142 42, 156 22" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+            <div class="card" style="height: 140px">
+              <div class="k">PLTR</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(139,92,246,.75)">
+                <path d="M4 34 C 18 20, 36 40, 54 18 S 96 14, 116 26 S 142 44, 156 20" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+            <div class="card" style="height: 140px">
+              <div class="k">NFLX</div>
+              <svg viewBox="0 0 160 46" style="width: 100%; height: 46px; margin-top: 10px; color: rgba(251,191,36,.75)">
+                <path d="M4 26 C 20 10, 36 44, 56 22 S 98 12, 116 24 S 140 40, 156 16" fill="none" stroke="currentColor" stroke-width="2" class="dashline"></path>
+              </svg>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="artboard">
+        <div class="label">Playback • Controls</div>
+        <div class="screen">
+          <div class="topbar">
+            <div class="pill">
+              <svg aria-hidden="true"><use href="#icon-bolt"></use></svg>
+              Speed 0.6s/bar
+            </div>
+            <div class="pill">
+              <svg style="color: var(--violet)" aria-hidden="true"><use href="#icon-spark"></use></svg>
+              datetime-local
+            </div>
+          </div>
+          <div style="padding: 0 16px 10px 16px">
+            <div style="font-size: 22px; font-weight: 950; letter-spacing: -0.03em">Replay like it’s live.</div>
+            <div style="margin-top: 8px; font-size: 12px; color: rgba(255,255,255,.6); line-height: 1.45">
+              切换回放后，分钟K线会按节奏推送更新。你看到的每一次波动，都是真实历史数据的重演。
+            </div>
+          </div>
+          <div style="padding: 0 16px 16px 16px; display: grid; grid-template-columns: 1fr; gap: 10px">
+            <div class="card">
+              <div class="k">Start Time</div>
+              <div class="v" style="font-size: 13px">2026-01-10 09:35</div>
+            </div>
+            <div class="card">
+              <div class="k">Symbols</div>
+              <div class="v" style="font-size: 13px">META, NVDA, TSM, PLTR…</div>
+            </div>
+            <div class="card">
+              <div class="k">Mode</div>
+              <div class="v" style="font-size: 13px">Playback ↔ Realtime</div>
+            </div>
+          </div>
+          <div class="thumb">
+            <svg viewBox="0 0 320 210" preserveAspectRatio="xMidYMid slice">
+              <image
+                href="https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=900&q=80"
+                x="0"
+                y="0"
+                width="320"
+                height="210"
+                opacity="0.85"
+              ></image>
+              <rect x="0" y="0" width="320" height="210" fill="rgba(0,0,0,.35)"></rect>
+              <text x="16" y="36" fill="rgba(255,255,255,.88)" font-size="12" font-weight="900">Unsplash placeholder via &lt;image&gt;</text>
+            </svg>
+          </div>
+        </div>
+      </section>
+
+      <section class="artboard">
+        <div class="label">News • Signal</div>
+        <div class="screen">
+          <div class="topbar">
+            <div class="pill">
+              <svg style="color: var(--amber)" aria-hidden="true"><use href="#icon-fire"></use></svg>
+              Breaking
+            </div>
+            <div class="pill">
+              <svg aria-hidden="true"><use href="#icon-spark"></use></svg>
+              Benzinga
+            </div>
+          </div>
+          <div style="padding: 0 16px 10px 16px">
+            <div style="font-size: 22px; font-weight: 950; letter-spacing: -0.03em">Signal Feed</div>
+            <div style="margin-top: 8px; font-size: 12px; color: rgba(255,255,255,.6); line-height: 1.45">
+              News + quant + AI 的节奏要像短视频：信息密度高，但你不费脑。
+            </div>
+          </div>
+          <div style="padding: 0 16px 16px 16px; display: grid; grid-template-columns: 1fr; gap: 10px">
+            <div class="card">
+              <div class="k">⚡ Quant</div>
+              <div class="v" style="font-size: 13px">Z-score momentum breakout detected.</div>
+            </div>
+            <div class="card">
+              <div class="k">🔥 AI</div>
+              <div class="v" style="font-size: 13px">Liquidity ok • trend ok • plan generated.</div>
+            </div>
+            <div class="card">
+              <div class="k">📰 News</div>
+              <div class="v" style="font-size: 13px">Headline placeholder. Tap to open.</div>
+            </div>
+          </div>
+          <div class="thumb">
+            <svg viewBox="0 0 320 210" preserveAspectRatio="xMidYMid slice">
+              <image
+                href="https://images.unsplash.com/photo-1559526324-4b87b5e36e44?auto=format&fit=crop&w=900&q=80"
+                x="0"
+                y="0"
+                width="320"
+                height="210"
+                opacity="0.82"
+              ></image>
+              <rect x="0" y="0" width="320" height="210" fill="rgba(0,0,0,.4)"></rect>
+              <text x="16" y="36" fill="rgba(255,255,255,.86)" font-size="12" font-weight="900">Holographic layering</text>
+              <path
+                d="M10 160 C 36 122, 70 198, 98 144 S 154 94, 186 124 S 240 188, 312 114"
+                fill="none"
+                stroke="rgba(34,211,238,.9)"
+                stroke-width="3"
+                class="dashline"
+              ></path>
+            </svg>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
+

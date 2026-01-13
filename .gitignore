@@ -1,0 +1,17 @@
+# IDE
+.trae/
+.vscode/
+.idea/
+.DS_Store
+
+# Backend
+backend/.venv/
+backend/__pycache__/
+backend/.env
+*.pyc
+
+# Frontend
+frontend/.next/
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local

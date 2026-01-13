@@ -1,0 +1,80 @@
+Technical Specifications:
+	•	Each HTML file should display four horizontally arranged page previews per row, with multiple rows allowed. The code should include all functional pages.
+	•	▸ Artboard size: 375x812 (with a 1px border simulating a mobile phone frame)
+	•	▸ Must include:
+	•	Vector icon system (using <symbol> definition)
+	•	Dynamic line chart (using stroke-dasharray animation)
+	•	Card hover effect (implemented via filter)
+	•	Use <image> tag with external links to Unsplash as placeholders
+
+New Visual Style: Technological and High-Interactivity Design (Neumorphism)
+	1.	Visual Characteristics
+1.1 Color Style
+	•	Primarily cool tones:
+	•	Commonly uses blue, purple, black, silver, etc., with highlighter neon colors (such as blue-green, purple-pink, orange-yellow) as accents.
+	•	Gradients and lighting effects:
+	•	Extensive use of gradients, glow effects, and highlight lines to create a futuristic, technological atmosphere.
+	•	Dark mode:
+	•	Mostly dark backgrounds, highlighting content and glowing elements to enhance immersion.
+1.2 Material and Texture
+	•	Glassmorphism:
+	•	Semi-transparent glass texture with blur effects to enhance a sense of technology and layering.
+	•	Metallic and glossy:
+	•	Surfaces may have metallic textures or glossy reflections, adding a sense of premium quality.
+	•	Grids and lines:
+	•	Backgrounds or decorative elements often use grids, geometric lines, or dynamic particles to emphasize technological elements.
+	2.	Animation Design
+2.1 High-Interactivity Animations
+	•	Micro-interactions:
+	•	Buttons, sliders, icons, and other interactive elements provide feedback animations when clicked or swiped, such as slight bouncing, scaling, or glowing.
+	•	Loading animations:
+	•	Use dynamic lines, rotating particles, or data streams to reduce the boredom of waiting.
+	•	Page transitions:
+	•	Smooth transitions, page flips, or layered animations enhance fluidity during page switches.
+2.2 Dynamic Data Display
+	•	Real-time updates:
+	•	Data charts (e.g., line charts, bar charts) update dynamically to simulate smooth data flow.
+	•	Number rolling:
+	•	Numbers change with rolling or gradient effects to emphasize technological style.
+2.3 3D Dynamic Effects
+	•	3D elements:
+	•	Use 3D models or dynamic graphics (such as rotating globes, 3D icons) to enhance spatial perception.
+	•	Parallax scrolling:
+	•	When scrolling, foreground and background move at different speeds, increasing immersion.
+	3.	Typography Design
+3.1 Font Style
+	•	Clean, modern sans-serif fonts:
+	•	Often uses futuristic fonts (e.g., Roboto, SF Pro, Futura).
+	•	Font weight contrast:
+	•	Headings are bold, body text is lighter, highlighting hierarchy.
+	•	Geometric fonts:
+	•	Fonts may feature geometric lines or breaks to enhance the futuristic feel.
+3.2 Font Color
+	•	High contrast:
+	•	Bright colors like white, neon blue, fluorescent green on dark backgrounds.
+	•	Gradient text:
+	•	Some headings or decorative text use gradients to enhance the technological atmosphere.
+	•	Dynamic text:
+	•	Text may feature glowing, flickering, or scrolling effects to enhance motion.
+	4.	Interaction Design
+4.1 Gestures
+	•	Supports multiple gestures (e.g., swipe, long press, double-tap) to enhance freedom and engagement in operation.
+	•	Animation feedback is closely tied to gestures, providing a natural and smooth experience.
+4.2 Voice and AI Interaction
+	•	Integrates voice assistant or AI features to support voice commands, smart recommendations, and personalized services.
+4.3 Real-Time Feedback
+	•	Immediate feedback after user actions, such as button color changes, data updates, dynamic prompts, etc.
+	5.	Layout and Information Architecture
+5.1 Modular Layout
+	•	Clear interface partitioning, with data and functions displayed as cards or modules for quick browsing and operation.
+	•	Commonly uses grid or layered layouts to embody the technological sense of order.
+5.2 Information Hierarchy
+	•	Important information is highlighted using font size, color, or dynamic effects; secondary information is de-emphasized.
+	•	Use whitespace and alignment to optimize reading experience and avoid information overload.
+	6.	Technological Elements
+	•	Dynamic particle effects:
+	•	Add dynamic particles (such as light spots, data streams) in the background or interactions to enhance the technological atmosphere.
+	•	Holographic projection style:
+	•	Interface elements may simulate the transparency and floating effects of holographic projection.
+	•	Futuristic icons:
+	•	Icon design is simple yet futuristic, possibly with lighting effects or dynamic changes.
