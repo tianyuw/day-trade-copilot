@@ -29,10 +29,22 @@ export default {
           "0%": { strokeDashoffset: "240" },
           "100%": { strokeDashoffset: "0" },
         },
+        "gradient-x": {
+          "0%, 100%": {
+            "background-size": "200% 200%",
+            "background-position": "left center",
+          },
+          "50%": {
+            "background-size": "200% 200%",
+            "background-position": "right center",
+          },
+        },
       },
       animation: {
         glow: "glow 2.8s ease-in-out infinite",
         dash: "dash 1.6s ease-out forwards",
+        "gradient-x": "gradient-x 15s ease infinite",
+        "pulse-slow": "pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite",
       },
     },
   },

@@ -12,6 +12,7 @@ from .alpaca_client import AlpacaClient
 from .openrouter_client import OpenRouterClient
 from .schemas import AIVerificationRequest, StreamBarMessage, StreamDoneMessage, StreamInitMessage
 from .settings import get_settings
+from .indicators import ZScoreMomentum
 
 
 def create_app() -> FastAPI:
@@ -103,12 +104,33 @@ def create_app() -> FastAPI:
     async def ws_realtime(ws: WebSocket, symbols: str = Query(default="AAPL,MSFT,NVDA,TSLA,SPY")) -> None:
         await ws.accept()
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        
+        # Initialize indicators for realtime
+        indicators: dict[str, ZScoreMomentum] = {}
+        # Fetch daily history for indicators
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        daily_start = (today - timedelta(days=60)).isoformat() # Get enough history
+        
         try:
+            # We need daily bars for indicators
+            daily_bars = await alpaca.get_bars(symbol_list, timeframe="1Day", start=daily_start, limit=100)
+            for sym in symbol_list:
+                bars = daily_bars.get(sym, [])
+                indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
+
             backfill = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=200)
             for sym, bars in backfill.items():
+                # Process backfill to warmup indicators
+                for bar in bars:
+                    diff = indicators[sym].update(float(bar.c))
+                    bar.indicators = {"z_score_diff": diff}
+                
                 await ws.send_json(StreamInitMessage(type="init", mode="realtime", symbol=sym, bars=bars).model_dump())
 
             async for sym, bar in alpaca.stream_minute_bars(symbol_list):
+                if sym in indicators:
+                    diff = indicators[sym].update(float(bar.c))
+                    bar.indicators = {"z_score_diff": diff}
                 await ws.send_json(StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump())
         except WebSocketDisconnect:
             return
@@ -133,16 +155,50 @@ def create_app() -> FastAPI:
             warmup_minutes = 21
             base_cursor = 0
             request_start = start
+            start_dt = None
             if start:
                 start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
                 warmup_start_dt = start_dt - timedelta(minutes=warmup_minutes)
                 request_start = warmup_start_dt.isoformat().replace("+00:00", "Z")
                 base_cursor = warmup_minutes
+            
+            # Initialize indicators with history relative to playback start
+            indicators: dict[str, ZScoreMomentum] = {}
+            if start_dt:
+                daily_end = (start_dt - timedelta(days=1)).date().isoformat()
+                daily_start = (start_dt - timedelta(days=60)).date().isoformat()
+                daily_bars = await alpaca.get_bars(symbol_list, timeframe="1Day", start=daily_start, end=daily_end, limit=100)
+                for sym in symbol_list:
+                    bars = daily_bars.get(sym, [])
+                    indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
+            else:
+                # Default to recent history if no start time
+                today = datetime.now(ZoneInfo("America/New_York")).date()
+                daily_start = (today - timedelta(days=60)).isoformat()
+                daily_bars = await alpaca.get_bars(symbol_list, timeframe="1Day", start=daily_start, limit=100)
+                for sym in symbol_list:
+                    bars = daily_bars.get(sym, [])
+                    indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
 
             bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", start=request_start, limit=limit)
             if all(len(v) == 0 for v in bars_by_symbol.values()):
                 bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=limit)
-            safe_cursor = max(0, base_cursor + cursor)
+            
+            # Fix: cursor is an absolute index from frontend, so we shouldn't add base_cursor to it again.
+            # We use max(cursor, base_cursor) to ensure we start at least after the warmup period.
+            safe_cursor = max(cursor, base_cursor)
+            
+            # Pre-calculate indicators for all bars
+            for sym, bars in bars_by_symbol.items():
+                if sym in indicators:
+                    # We need to re-run indicator update from start of bars to ensure EMA state is correct
+                    # But if we jump via cursor, we might miss state updates. 
+                    # For simplicity in playback, we re-run all from index 0 of fetched bars.
+                    # Ideally we should fetch more warmup bars.
+                    for bar in bars:
+                        diff = indicators[sym].update(float(bar.c))
+                        bar.indicators = {"z_score_diff": diff}
+
             history_padding = warmup_minutes
             for sym, bars in bars_by_symbol.items():
                 end = min(safe_cursor, len(bars))

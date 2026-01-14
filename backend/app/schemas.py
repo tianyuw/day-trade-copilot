@@ -14,6 +14,7 @@ class AlpacaBar(BaseModel):
     v: float | int
     n: int | None = None
     vw: float | None = None
+    indicators: dict[str, float] | None = None
 
 
 class StreamBarMessage(BaseModel):

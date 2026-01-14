@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useRef } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   type IChartApi,
   type CandlestickData,
@@ -21,6 +21,9 @@ type Bar = {
   l: number
   c: number
   v?: number
+  indicators?: {
+    z_score_diff?: number
+  }
 }
 
 function toEpochSeconds(rfc3339: string): number {
@@ -37,15 +40,30 @@ function formatPSTFromUtcSeconds(utcSeconds: number): string {
   return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
 }
 
-function barsToCandles(bars: Bar[]): CandlestickData<Time>[] {
+function barsToCandles(
+  bars: Bar[],
+  flashingBarTime: number | null,
+): CandlestickData<Time>[] {
   return bars
-    .map((b) => ({
-      time: toEpochSeconds(b.t) as Time,
-      open: b.o,
-      high: b.h,
-      low: b.l,
-      close: b.c,
-    }))
+    .map((b) => {
+      const time = toEpochSeconds(b.t) as Time
+      const zScoreDiff = b.indicators?.z_score_diff ?? 0
+      
+      let color = undefined
+      let borderColor = undefined
+      let wickColor = undefined
+      
+      return {
+        time,
+        open: b.o,
+        high: b.h,
+        low: b.l,
+        close: b.c,
+        color,
+        borderColor,
+        wickColor,
+      }
+    })
     .sort((a, b) => Number(a.time) - Number(b.time))
 }
 
@@ -59,6 +77,15 @@ function barsToVolumes(bars: Bar[]): HistogramData<Time>[] {
         color: up ? "rgba(34,211,238,.55)" : "rgba(248,113,113,.55)",
       }
     })
+    .sort((a, b) => Number(a.time) - Number(b.time))
+}
+
+function barsToZScoreDiff(bars: Bar[]): LineData<Time>[] {
+  return bars
+    .map((b) => ({
+      time: toEpochSeconds(b.t) as Time,
+      value: b.indicators?.z_score_diff ?? 0,
+    }))
     .sort((a, b) => Number(a.time) - Number(b.time))
 }
 
@@ -136,12 +163,14 @@ function computeVWAP(bars: Bar[]): LineData<Time>[] {
 export function CandleCard({
   symbol,
   bars,
+  prevClose,
   percentChange,
   status,
   className,
 }: {
   symbol: string
   bars: Bar[]
+  prevClose?: number | null
   percentChange?: number | null
   status?: "hot" | "watch" | "normal"
   className?: string
@@ -150,15 +179,15 @@ export function CandleCard({
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null)
   const volumeSeriesRef = useRef<ReturnType<IChartApi["addHistogramSeries"]> | null>(null)
-
+  const zScoreSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const ema9SeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const ema21SeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const vwapSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbUpperSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbMiddleSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbLowerSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
-
-  const candles = useMemo(() => barsToCandles(bars), [bars])
+  
+  const candles = useMemo(() => barsToCandles(bars, null), [bars])
   const volumes = useMemo(() => barsToVolumes(bars), [bars])
 
   const ema9 = useMemo(() => computeEMA(bars, 9), [bars])
@@ -185,9 +214,19 @@ export function CandleCard({
         horzLines: { color: "rgba(255,255,255,.06)" },
       },
       crosshair: {
-        mode: CrosshairMode.Magnet,
-        vertLine: { color: "rgba(34,211,238,.35)" },
-        horzLine: { color: "rgba(124,58,237,.25)" },
+        mode: CrosshairMode.Normal,
+        vertLine: {
+          color: "rgba(34,211,238,0.5)",
+          width: 1,
+          style: 1, // LineStyle.Dotted
+          labelBackgroundColor: "#22d3ee",
+        },
+        horzLine: {
+          color: "rgba(34,211,238,0.5)",
+          width: 1,
+          style: 1, // LineStyle.Dotted
+          labelBackgroundColor: "#22d3ee",
+        },
       },
       timeScale: {
         borderColor: "rgba(255,255,255,.08)",
@@ -210,10 +249,25 @@ export function CandleCard({
       rightPriceScale: {
         borderColor: "rgba(255,255,255,.08)",
         scaleMargins: { top: 0.08, bottom: 0.28 },
+        visible: true, // Main chart scale
       },
       handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
       handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
     })
+    
+    // Create Price Scale for Indicator (bottom pane)
+    // We want main chart to take top 65% and indicator take bottom 30%
+    // Main chart margins: top: 0.05, bottom: 0.35
+    // Indicator chart margins: top: 0.70, bottom: 0
+    
+    // Configure Main Price Scale
+    chart.priceScale("right").applyOptions({
+        scaleMargins: { top: 0.08, bottom: 0.28 },
+    })
+    
+    // We don't need 'left' scale anymore
+    chart.priceScale("left").applyOptions({ visible: false })
+
     const series = chart.addCandlestickSeries({
       upColor: "rgba(34,211,238,1)",
       downColor: "rgba(248,113,113,1)",
@@ -281,7 +335,7 @@ export function CandleCard({
       scaleMargins: { top: 0.78, bottom: 0 },
       visible: false,
     })
-
+    
     chartRef.current = chart
     seriesRef.current = series
     volumeSeriesRef.current = volumeSeries
@@ -307,62 +361,221 @@ export function CandleCard({
 
   useEffect(() => {
     if (!seriesRef.current) return
-    if (!candles.length) return
     seriesRef.current.setData(candles)
   }, [candles])
 
   useEffect(() => {
     if (!volumeSeriesRef.current) return
-    if (!volumes.length) return
     volumeSeriesRef.current.setData(volumes)
   }, [volumes])
 
   useEffect(() => {
-    if (ema9SeriesRef.current && ema9.length) ema9SeriesRef.current.setData(ema9)
-    if (ema21SeriesRef.current && ema21.length) ema21SeriesRef.current.setData(ema21)
-    if (vwapSeriesRef.current && vwap.length) vwapSeriesRef.current.setData(vwap)
-    if (bbUpperSeriesRef.current && bbUpper.length) bbUpperSeriesRef.current.setData(bbUpper)
-    if (bbMiddleSeriesRef.current && bbMiddle.length) bbMiddleSeriesRef.current.setData(bbMiddle)
-    if (bbLowerSeriesRef.current && bbLower.length) bbLowerSeriesRef.current.setData(bbLower)
+    // Helper to safely set data or clear series
+    const updateSeries = (seriesRef: any, data: any[]) => {
+      if (!seriesRef.current) return
+      seriesRef.current.setData(data)
+    }
+
+    updateSeries(ema9SeriesRef, ema9)
+    updateSeries(ema21SeriesRef, ema21)
+    updateSeries(vwapSeriesRef, vwap)
+    updateSeries(bbUpperSeriesRef, bbUpper)
+    updateSeries(bbMiddleSeriesRef, bbMiddle)
+    updateSeries(bbLowerSeriesRef, bbLower)
   }, [ema9, ema21, vwap, bbUpper, bbMiddle, bbLower])
+
+  const [overlayData, setOverlayData] = useState<{
+    ema9?: number
+    ema21?: number
+    vwap?: number
+    bbUpper?: number
+    bbMiddle?: number
+    bbLower?: number
+    volume?: number
+    price?: number
+    time?: number
+  } | null>(null)
+
+  useEffect(() => {
+    if (!chartRef.current || !seriesRef.current) return
+
+    const handleCrosshairMove = (param: any) => {
+      if (
+        param.point === undefined ||
+        !param.time ||
+        param.point.x < 0 ||
+        param.point.x > containerRef.current!.clientWidth ||
+        param.point.y < 0 ||
+        param.point.y > containerRef.current!.clientHeight
+      ) {
+        // Crosshair is out of chart, use latest bar data
+        if (candles.length > 0) {
+          const lastIdx = candles.length - 1
+          const time = Number(candles[lastIdx].time)
+          
+          // Find indicator values for this time
+          const findVal = (data: LineData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+          const findVol = (data: HistogramData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+          const findPrice = (data: CandlestickData<Time>[]) => data.find((d) => Number(d.time) === time)?.close
+
+          setOverlayData({
+            ema9: findVal(ema9),
+            ema21: findVal(ema21),
+            vwap: findVal(vwap),
+            bbUpper: findVal(bbUpper),
+            bbMiddle: findVal(bbMiddle),
+            bbLower: findVal(bbLower),
+            volume: findVol(volumes),
+            price: findPrice(candles),
+            time: time,
+          })
+        } else {
+            setOverlayData(null)
+        }
+        return
+      }
+
+      // User hovering
+      const time = param.time as number
+      const seriesData = param.seriesData
+      const price = seriesData.get(seriesRef.current!)?.close || seriesData.get(seriesRef.current!)?.value
+
+      // Find indicator values for this time
+      const findVal = (data: LineData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+      const findVol = (data: HistogramData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+
+      setOverlayData({
+        ema9: findVal(ema9),
+        ema21: findVal(ema21),
+        vwap: findVal(vwap),
+        bbUpper: findVal(bbUpper),
+        bbMiddle: findVal(bbMiddle),
+        bbLower: findVal(bbLower),
+        volume: findVol(volumes),
+        price: typeof price === 'number' ? price : undefined,
+        time: time,
+      })
+    }
+
+    chartRef.current.subscribeCrosshairMove(handleCrosshairMove)
+    
+    // Initial data set
+    if (candles.length > 0) {
+         const lastIdx = candles.length - 1
+          const time = Number(candles[lastIdx].time)
+          const findVal = (data: LineData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+          const findVol = (data: HistogramData<Time>[]) => data.find((d) => Number(d.time) === time)?.value
+          const findPrice = (data: CandlestickData<Time>[]) => data.find((d) => Number(d.time) === time)?.close
+
+          setOverlayData({
+            ema9: findVal(ema9),
+            ema21: findVal(ema21),
+            vwap: findVal(vwap),
+            bbUpper: findVal(bbUpper),
+            bbMiddle: findVal(bbMiddle),
+            bbLower: findVal(bbLower),
+            volume: findVol(volumes),
+            price: findPrice(candles),
+            time: time,
+          })
+    } else {
+        setOverlayData(null)
+    }
+
+    return () => {
+      chartRef.current?.unsubscribeCrosshairMove(handleCrosshairMove)
+    }
+  }, [candles, ema9, ema21, vwap, bbUpper, bbMiddle, bbLower, volumes])
+
+  const currentPrice = overlayData?.price ?? (candles.length > 0 ? candles[candles.length - 1].close : null)
+  const priceChange = (typeof currentPrice === 'number' && typeof prevClose === 'number') 
+    ? ((currentPrice - prevClose) / prevClose * 100) 
+    : null
+
 
   const badge = status === "hot" ? "🔥 AI" : status === "watch" ? "⚡ Quant" : ""
 
   return (
     <div
       className={cn(
-        "group relative overflow-hidden rounded-3xl bg-white/6 p-4 shadow-neo ring-1 ring-white/10 backdrop-blur-md",
+        "group relative flex flex-col overflow-hidden rounded-3xl bg-white/6 p-4 shadow-neo ring-1 ring-white/10 backdrop-blur-md",
         "transition hover:shadow-neoHover hover:drop-shadow-[0_0_18px_rgba(124,58,237,.45)]",
         className,
       )}
     >
       <div className="absolute inset-0 bg-neon-radial opacity-70" />
+      
+      <div className="absolute top-4 left-4 z-10 pointer-events-none select-none flex flex-col gap-1">
+        <div className="flex items-baseline gap-2">
+          <span className="text-2xl font-bold text-white tracking-tight">{symbol}</span>
+          {priceChange !== null && (
+            <span
+              className={cn(
+                "text-lg font-medium",
+                priceChange >= 0 ? "text-emerald-400" : "text-red-400"
+              )}
+            >
+              {priceChange >= 0 ? "+" : ""}
+              {priceChange.toFixed(2)}%
+            </span>
+          )}
+        </div>
+        
+        {overlayData && (
+          <div className="flex flex-col gap-0.5 text-xs font-mono font-medium">
+            {overlayData.ema9 !== undefined && (
+              <div className="flex items-center gap-2">
+                <span className="text-white/40 w-8">EMA9</span>
+                <span className="text-emerald-400">{overlayData.ema9.toFixed(2)}</span>
+              </div>
+            )}
+            {overlayData.ema21 !== undefined && (
+              <div className="flex items-center gap-2">
+                <span className="text-white/40 w-8">EMA21</span>
+                <span className="text-red-400">{overlayData.ema21.toFixed(2)}</span>
+              </div>
+            )}
+            {overlayData.volume !== undefined && (
+               <div className="flex items-center gap-2">
+                 <span className="text-white/40 w-8">Vol</span>
+                 <span className={cn(
+                   (overlayData.price !== undefined && (candles.find(c => Number(c.time) === overlayData.time)?.open || 0) <= overlayData.price) 
+                     ? "text-cyan-400" 
+                     : "text-red-400"
+                 )}>
+                   {overlayData.volume.toLocaleString()}
+                 </span>
+               </div>
+            )}
+            {overlayData.vwap !== undefined && (
+              <div className="flex items-center gap-2 mt-1">
+                <span className="text-white/60">VWAP</span>
+                <span className="text-white">{overlayData.vwap.toFixed(2)}</span>
+              </div>
+            )}
+             {overlayData.bbUpper !== undefined && (
+              <div className="flex items-center gap-2">
+                <span className="text-white/40 w-8">BB</span>
+                <span className="text-purple-400">{overlayData.bbUpper.toFixed(2)}</span>
+                <span className="text-blue-400">{overlayData.bbMiddle?.toFixed(2)}</span>
+                <span className="text-yellow-400">{overlayData.bbLower?.toFixed(2)}</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       <div className="relative flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <div className="text-sm font-extrabold tracking-tight">{symbol}</div>
-            {typeof percentChange === "number" && Number.isFinite(percentChange) ? (
-              <div
-                className={cn(
-                  "rounded-full bg-black/30 px-2 py-0.5 text-[10px] font-bold ring-1 ring-white/10",
-                  percentChange >= 0 ? "text-emerald-200" : "text-red-200",
-                )}
-              >
-                {percentChange >= 0 ? "+" : ""}
-                {percentChange.toFixed(2)}%
-              </div>
-            ) : null}
-            {badge ? (
-              <div className="rounded-full bg-black/30 px-2 py-0.5 text-[10px] font-bold ring-1 ring-white/10">
-                {badge}
-              </div>
-            ) : null}
+            
+            {/* Old header content removed/hidden */}
           </div>
         </div>
 
       </div>
 
-      <div className="relative mt-3 h-[240px] w-full">
+      <div className="relative mt-3 h-full w-full flex-1 min-h-[400px]">
         <div ref={containerRef} className="h-full w-full" />
       </div>
     </div>
