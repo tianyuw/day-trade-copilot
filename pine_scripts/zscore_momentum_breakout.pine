@@ -13,7 +13,8 @@ calc_ticker = ticker == "" ? syminfo.tickerid : ticker
 // 统计周期（天）
 lookback_days = input.int(30, "Lookback Days (Days)")
 // 阈值
-threshold = input.float(0.1, "Threshold")
+threshold_upper = input.float(0.006, "Upper Threshold")
+threshold_lower = input.float(-0.006, "Lower Threshold")
 
 // --- 1. 计算均值 (A) 和 标准差 (B) ---
 // 需求：过去 30 天盘中价格的均值和标准差。
@@ -41,21 +42,25 @@ ema_z_prev = ema_z[1]
 diff = ema_z - ema_z_prev
 
 // --- 4. 标记信号 ---
-// 如果 diff > 阈值，且上一根 K 线的 diff <= 阈值，则视为起始点
-is_signal_start = diff > threshold and diff[1] <= threshold
+// 如果 diff 上穿 threshold_upper，视为做多信号
+is_long_signal = ta.crossover(diff, threshold_upper)
+// 如果 diff 下穿 threshold_lower，视为做空信号
+is_short_signal = ta.crossunder(diff, threshold_lower)
 
 // --- 5. 绘图与可视化 ---
 // 绘制 Diff 曲线
 plot(diff, "Diff Value", color=color.blue, linewidth=2)
 
 // 绘制阈值线
-hline(threshold, "Threshold", color=color.red, linestyle=hline.style_dashed)
+hline(threshold_upper, "Upper Threshold", color=color.green, linestyle=hline.style_dashed)
+hline(threshold_lower, "Lower Threshold", color=color.red, linestyle=hline.style_dashed)
 
-// 当触发信号起始点时，改变背景颜色
-bgcolor(is_signal_start ? color.new(color.green, 50) : na)
+// 当触发信号时，改变背景颜色
+// 上穿 0.006 -> 绿色背景
+// 下穿 -0.006 -> 红色背景
+bgcolor(is_long_signal ? color.new(color.green, 50) : is_short_signal ? color.new(color.red, 50) : na)
 
-// 当触发信号起始点时，改变主图 K 线颜色
-barcolor(is_signal_start ? color.green : color.gray)
+// 不要对主图 K 线颜色做更改 (已删除 barcolor 相关代码)
 
 // 辅助绘图
 plot(z_score, "Z-Score (Hidden)", display=display.none)

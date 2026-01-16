@@ -7,6 +7,7 @@ import {
   type HistogramData,
   type LineData,
   type Time,
+  type SeriesMarker,
   createChart,
   ColorType,
   CrosshairMode,
@@ -23,6 +24,7 @@ type Bar = {
   v?: number
   indicators?: {
     z_score_diff?: number
+    signal?: "long" | "short"
   }
 }
 
@@ -42,16 +44,10 @@ function formatPSTFromUtcSeconds(utcSeconds: number): string {
 
 function barsToCandles(
   bars: Bar[],
-  flashingBarTime: number | null,
 ): CandlestickData<Time>[] {
   return bars
     .map((b) => {
       const time = toEpochSeconds(b.t) as Time
-      const zScoreDiff = b.indicators?.z_score_diff ?? 0
-      
-      let color = undefined
-      let borderColor = undefined
-      let wickColor = undefined
       
       return {
         time,
@@ -59,12 +55,30 @@ function barsToCandles(
         high: b.h,
         low: b.l,
         close: b.c,
-        color,
-        borderColor,
-        wickColor,
       }
     })
     .sort((a, b) => Number(a.time) - Number(b.time))
+}
+
+function barsToMarkers(bars: Bar[]): SeriesMarker<Time>[] {
+    const markers: SeriesMarker<Time>[] = []
+    
+    bars.forEach((b) => {
+        if (!b.indicators?.signal) return
+        
+        const time = toEpochSeconds(b.t) as Time
+        const isLong = b.indicators.signal === "long"
+        
+        markers.push({
+            time,
+            position: 'aboveBar',
+            color: isLong ? '#22c55e' : '#ef4444', // Green-500 : Red-500
+            shape: 'circle',
+            size: 1, // default is 1, can be adjusted
+        })
+    })
+    
+    return markers.sort((a, b) => Number(a.time) - Number(b.time))
 }
 
 function barsToVolumes(bars: Bar[]): HistogramData<Time>[] {
@@ -167,6 +181,10 @@ export function CandleCard({
   percentChange,
   status,
   className,
+  isAnalyzing,
+  onPause,
+  onResume,
+  onAnalyze,
 }: {
   symbol: string
   bars: Bar[]
@@ -174,6 +192,10 @@ export function CandleCard({
   percentChange?: number | null
   status?: "hot" | "watch" | "normal"
   className?: string
+  isAnalyzing?: boolean
+  onPause?: () => void
+  onResume?: () => void
+  onAnalyze?: (time: string) => Promise<void>
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -187,7 +209,39 @@ export function CandleCard({
   const bbMiddleSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbLowerSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   
-  const candles = useMemo(() => barsToCandles(bars, null), [bars])
+  const [lastAnalyzedTime, setLastAnalyzedTime] = useState<number | null>(null)
+
+  // Monitor for signals and trigger analysis
+  useEffect(() => {
+    if (bars.length === 0) return
+    const lastBar = bars[bars.length - 1]
+    
+    // Check if we have a signal on the latest bar
+    if (lastBar.indicators?.signal && onPause && onAnalyze && onResume) {
+        const time = toEpochSeconds(lastBar.t)
+        
+        // Only analyze if we haven't analyzed this bar yet
+        if (lastAnalyzedTime !== time) {
+            setLastAnalyzedTime(time)
+            
+            // Execute Sequential Logic: Pause -> Analyze -> Resume
+            const runAnalysis = async () => {
+                onPause()
+                try {
+                    await onAnalyze(lastBar.t)
+                } finally {
+                    // Auto-resume after analysis is done (or failed)
+                    onResume()
+                }
+            }
+            
+            runAnalysis()
+        }
+    }
+  }, [bars, onPause, onAnalyze, onResume, lastAnalyzedTime])
+
+  const candles = useMemo(() => barsToCandles(bars), [bars])
+  const markers = useMemo(() => barsToMarkers(bars), [bars])
   const volumes = useMemo(() => barsToVolumes(bars), [bars])
 
   const ema9 = useMemo(() => computeEMA(bars, 9), [bars])
@@ -362,7 +416,8 @@ export function CandleCard({
   useEffect(() => {
     if (!seriesRef.current) return
     seriesRef.current.setData(candles)
-  }, [candles])
+    seriesRef.current.setMarkers(markers)
+  }, [candles, markers])
 
   useEffect(() => {
     if (!volumeSeriesRef.current) return
@@ -504,6 +559,13 @@ export function CandleCard({
       )}
     >
       <div className="absolute inset-0 bg-neon-radial opacity-70" />
+      
+      {isAnalyzing && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-300">
+            <div className="h-12 w-12 rounded-full border-4 border-white/10 border-t-cyan-400 animate-spin mb-4" />
+            <div className="text-cyan-400 font-mono font-bold animate-pulse">AI Analyzing Signal...</div>
+        </div>
+      )}
       
       <div className="absolute top-4 left-4 z-10 pointer-events-none select-none flex flex-col gap-1">
         <div className="flex items-baseline gap-2">

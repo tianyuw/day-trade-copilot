@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { CandleCard } from "../../components/CandleCard"
+import { AICopilot, type ChatMessage } from "../../components/AICopilot"
 
 type StreamInit = {
   type: "init"
@@ -11,11 +12,10 @@ type StreamInit = {
   cursor?: number
 }
 type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; bar: any; i?: number }
+type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
 type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
 type StreamError = { type: "error"; message: string }
-type StreamMessage = StreamInit | StreamBar | StreamDone | StreamError
-
-type ChatMessage = { role: "ai" | "system"; content: string; time: string }
+type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamDone | StreamError
 
 const DEFAULT_SYMBOLS = ["META", "NVDA", "TSM", "PLTR", "AAPL", "NFLX", "SPY", "QQQ"]
 
@@ -30,85 +30,8 @@ function toRFC3339FromPSTInput(v: string): string | null {
   return d.toISOString()
 }
 
-function AICopilotPanel({ symbol, lastBar, resetToken }: { symbol: string; lastBar: any; resetToken: number }) {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-
-  useEffect(() => {
-    // Force reset state
-    setMessages([
-      {
-        role: "system",
-        content: `AI Copilot initialized for ${symbol}. Monitoring price action...`,
-        time: new Date().toLocaleTimeString(),
-      },
-    ])
-  }, [symbol, resetToken])
-
-  useEffect(() => {
-    if (!lastBar) return
-    const random = Math.random()
-    if (random > 0.9) {
-      const price = lastBar.c
-      const isUp = lastBar.c > lastBar.o
-      const msg = isUp
-        ? `Bullish momentum detected on ${symbol} at ${price.toFixed(2)}. Volume spike supports continuation.`
-        : `Selling pressure increasing on ${symbol} near ${price.toFixed(2)}. Watch for support breakdown.`
-
-      setMessages((prev) => {
-        const next: ChatMessage[] = [
-          ...prev,
-          { role: "ai", content: msg, time: new Date().toLocaleTimeString() },
-        ]
-        return next.slice(-5)
-      })
-    }
-  }, [lastBar, symbol])
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden rounded-3xl bg-white/5 shadow-glass ring-1 ring-white/10 backdrop-blur-xl">
-      <div className="border-b border-white/10 bg-white/5 px-6 py-4">
-        <div className="flex items-center gap-3">
-          <div className="grid h-8 w-8 place-items-center rounded-lg bg-indigo-500/20 ring-1 ring-indigo-500/50">
-             <svg className="h-4 w-4 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-             </svg>
-          </div>
-          <div>
-            <h3 className="font-bold text-white">AI Copilot</h3>
-            <p className="text-xs text-white/50">Gemini 3 Pro • Realtime Analysis</p>
-          </div>
-        </div>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-        {messages.map((msg, idx) => (
-          <div key={idx} className={`flex gap-4 ${msg.role === "system" ? "opacity-50" : ""}`}>
-            <div
-              className={`mt-1 h-2 w-2 flex-none rounded-full ${
-                msg.role === "system"
-                  ? "bg-white/30"
-                  : "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.5)]"
-              }`}
-            />
-            <div className="space-y-1">
-              <div className="text-xs font-mono text-white/30">{msg.time}</div>
-              <p className="text-sm leading-relaxed text-white/90">{msg.content}</p>
-            </div>
-          </div>
-        ))}
-        {messages.length === 0 && (
-          <div className="flex h-full items-center justify-center text-sm text-white/30">Waiting for market data...</div>
-        )}
-      </div>
-
-      <div className="border-t border-white/10 bg-black/20 px-6 py-4">
-        <div className="flex items-center gap-2 rounded-xl bg-white/5 px-4 py-2 ring-1 ring-white/10">
-          <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-xs font-medium text-white/50">Live Connection Active</span>
-        </div>
-      </div>
-    </div>
-  )
+function AICopilotPanel({ symbol, messages }: { symbol: string; messages: ChatMessage[] }) {
+  return <AICopilot symbol={symbol} messages={messages} />
 }
 
 export default function DashboardPage() {
@@ -122,10 +45,75 @@ export default function DashboardPage() {
   const [prevClose, setPrevClose] = useState<number | null>(null)
 
   const [bars, setBars] = useState<any[]>([])
+  
+  // AI State
+  const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
   const playbackCursorRef = useRef(0)
+
+  // Reset AI messages on symbol change or reset
+  useEffect(() => {
+    setAiMessages([
+      {
+        role: "system",
+        content: `AI Copilot initialized for ${selectedSymbol}. Monitoring price action...`,
+        time: new Date().toLocaleTimeString(),
+      },
+    ])
+  }, [selectedSymbol, resetToken])
+
+  const handlePause = () => {
+      setIsPlaying(false)
+  }
+  
+  const handleResume = () => {
+      setIsPlaying(true)
+  }
+  
+  const handleAnalyze = async (time: string) => {
+      setIsAnalyzing(true)
+      try {
+          const base = process.env.NEXT_PUBLIC_BACKEND_API ?? `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
+          const res = await fetch(`${base}/api/analyze`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                  symbol: selectedSymbol,
+                  current_time: time
+              })
+          })
+          
+          if (!res.ok) throw new Error("Analysis failed")
+          
+          const data = await res.json()
+          
+          setAiMessages(prev => [
+              ...prev,
+              {
+                  role: "ai",
+                  content: data, // Pass the whole object
+                  time: new Date().toLocaleTimeString(),
+                  type: "analysis"
+              }
+          ])
+          
+      } catch (e) {
+          console.error(e)
+          setAiMessages(prev => [
+              ...prev,
+              {
+                  role: "system",
+                  content: `Analysis Error: ${e instanceof Error ? e.message : 'Unknown error'}`,
+                  time: new Date().toLocaleTimeString(),
+              }
+          ])
+      } finally {
+          setIsAnalyzing(false)
+      }
+  }
 
   const startRFC = useMemo(() => toRFC3339FromPSTInput(startLocal), [startLocal])
 
@@ -159,7 +147,7 @@ export default function DashboardPage() {
 
     const base =
       process.env.NEXT_PUBLIC_BACKEND_WS ??
-      `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8001"}`
+      `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
     const url = `${base}/ws/playback?symbols=${encodeURIComponent(selectedSymbol)}&start=${encodeURIComponent(
       startRFC ?? "",
     )}&speed=1&cursor=${encodeURIComponent(String(playbackCursorRef.current))}`
@@ -205,6 +193,18 @@ export default function DashboardPage() {
         }
         if (msg.symbol === selectedSymbol) {
           setBars((prev) => [...prev, msg.bar].slice(-1000))
+        }
+      } else if (msg.type === "analysis") {
+        if (msg.symbol === selectedSymbol) {
+          setAiMessages(prev => [
+            ...prev,
+            {
+                role: "ai",
+                content: msg.result, 
+                time: new Date().toLocaleTimeString(),
+                type: "analysis"
+            }
+          ])
         }
       } else if (msg.type === "done") {
         setIsPlaying(false)
@@ -358,6 +358,10 @@ export default function DashboardPage() {
                    prevClose={prevClose}
                    className="h-full w-full !bg-transparent !shadow-none !ring-0 !backdrop-blur-none" 
                    status={isPlaying ? "hot" : "normal"}
+                   isAnalyzing={isAnalyzing}
+                   onPause={handlePause}
+                   onResume={handleResume}
+                   onAnalyze={handleAnalyze}
                 />
                 
                 {/* Overlay Info (optional) */}
@@ -377,7 +381,7 @@ export default function DashboardPage() {
 
           {/* Right: AI Copilot */}
           <div className="flex-1 min-w-[320px] hidden lg:block">
-            <AICopilotPanel symbol={selectedSymbol} lastBar={bars[bars.length - 1]} resetToken={resetToken} />
+            <AICopilotPanel symbol={selectedSymbol} messages={aiMessages} />
           </div>
 
         </div>

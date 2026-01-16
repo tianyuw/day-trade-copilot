@@ -5,20 +5,31 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Annotated
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .alpaca_client import AlpacaClient
 from .openrouter_client import OpenRouterClient
-from .schemas import AIVerificationRequest, StreamBarMessage, StreamDoneMessage, StreamInitMessage
+from .analysis_service import AnalysisService
+from .schemas import (
+    AIVerificationRequest,
+    StreamBarMessage,
+    StreamDoneMessage,
+    StreamInitMessage,
+    StreamAnalysisMessage,
+    LLMAnalysisRequest,
+    LLMAnalysisResponse,
+)
 from .settings import get_settings
-from .indicators import ZScoreMomentum
+from .indicators import ZScoreMomentum, MACD
+import pandas as pd
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     alpaca = AlpacaClient(settings)
     ai = OpenRouterClient(settings)
+    analysis_service = AnalysisService(alpaca)
 
     app = FastAPI(title="0DTE Copilot API", version="0.1.0")
     app.add_middleware(
@@ -32,6 +43,18 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     async def health() -> dict:
         return {"ok": True}
+
+    @app.post("/api/analyze", response_model=LLMAnalysisResponse)
+    async def analyze_chart(request: LLMAnalysisRequest):
+        """
+        Endpoint to trigger LLM analysis for a specific symbol and time.
+        """
+        try:
+            response = await analysis_service.analyze_signal(request)
+            return response
+        except Exception as e:
+            print(f"Analysis Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/stocks/bars")
     async def stocks_bars(
@@ -107,6 +130,7 @@ def create_app() -> FastAPI:
         
         # Initialize indicators for realtime
         indicators: dict[str, ZScoreMomentum] = {}
+        macd_indicators: dict[str, MACD] = {}
         # Fetch daily history for indicators
         today = datetime.now(ZoneInfo("America/New_York")).date()
         daily_start = (today - timedelta(days=60)).isoformat() # Get enough history
@@ -117,20 +141,37 @@ def create_app() -> FastAPI:
             for sym in symbol_list:
                 bars = daily_bars.get(sym, [])
                 indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
+                macd_indicators[sym] = MACD()
 
             backfill = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=200)
             for sym, bars in backfill.items():
                 # Process backfill to warmup indicators
                 for bar in bars:
-                    diff = indicators[sym].update(float(bar.c))
-                    bar.indicators = {"z_score_diff": diff}
+                    z_res = indicators[sym].update(float(bar.c))
+                    m_res = macd_indicators[sym].update(float(bar.c))
+                    
+                    final_signal = None
+                    if z_res.get('signal') == 'long':
+                        final_signal = 'long'
+                    elif z_res.get('signal') == 'short':
+                        final_signal = 'short'
+                        
+                    bar.indicators = {**z_res, **m_res, "signal": final_signal}
                 
                 await ws.send_json(StreamInitMessage(type="init", mode="realtime", symbol=sym, bars=bars).model_dump())
 
             async for sym, bar in alpaca.stream_minute_bars(symbol_list):
                 if sym in indicators:
-                    diff = indicators[sym].update(float(bar.c))
-                    bar.indicators = {"z_score_diff": diff}
+                    z_res = indicators[sym].update(float(bar.c))
+                    m_res = macd_indicators[sym].update(float(bar.c))
+                    
+                    final_signal = None
+                    if z_res.get('signal') == 'long':
+                        final_signal = 'long'
+                    elif z_res.get('signal') == 'short':
+                        final_signal = 'short'
+                        
+                    bar.indicators = {**z_res, **m_res, "signal": final_signal}
                 await ws.send_json(StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump())
         except WebSocketDisconnect:
             return
@@ -152,18 +193,22 @@ def create_app() -> FastAPI:
         await ws.accept()
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
         try:
-            warmup_minutes = 21
+            warmup_minutes = 200 + 21
             base_cursor = 0
             request_start = start
             start_dt = None
             if start:
                 start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                # We need enough history for:
+                # 1. Indicator warmup (21 mins)
+                # 2. Initial visible history (200 mins)
                 warmup_start_dt = start_dt - timedelta(minutes=warmup_minutes)
                 request_start = warmup_start_dt.isoformat().replace("+00:00", "Z")
                 base_cursor = warmup_minutes
             
             # Initialize indicators with history relative to playback start
             indicators: dict[str, ZScoreMomentum] = {}
+            macd_indicators: dict[str, MACD] = {}
             if start_dt:
                 daily_end = (start_dt - timedelta(days=1)).date().isoformat()
                 daily_start = (start_dt - timedelta(days=60)).date().isoformat()
@@ -171,6 +216,7 @@ def create_app() -> FastAPI:
                 for sym in symbol_list:
                     bars = daily_bars.get(sym, [])
                     indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
+                    macd_indicators[sym] = MACD()
             else:
                 # Default to recent history if no start time
                 today = datetime.now(ZoneInfo("America/New_York")).date()
@@ -179,6 +225,7 @@ def create_app() -> FastAPI:
                 for sym in symbol_list:
                     bars = daily_bars.get(sym, [])
                     indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
+                    macd_indicators[sym] = MACD()
 
             bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", start=request_start, limit=limit)
             if all(len(v) == 0 for v in bars_by_symbol.values()):
@@ -186,7 +233,7 @@ def create_app() -> FastAPI:
             
             # Fix: cursor is an absolute index from frontend, so we shouldn't add base_cursor to it again.
             # We use max(cursor, base_cursor) to ensure we start at least after the warmup period.
-            safe_cursor = max(cursor, base_cursor)
+            safe_cursor = max(cursor + 200, base_cursor)
             
             # Pre-calculate indicators for all bars
             for sym, bars in bars_by_symbol.items():
@@ -196,14 +243,42 @@ def create_app() -> FastAPI:
                     # For simplicity in playback, we re-run all from index 0 of fetched bars.
                     # Ideally we should fetch more warmup bars.
                     for bar in bars:
-                        diff = indicators[sym].update(float(bar.c))
-                        bar.indicators = {"z_score_diff": diff}
+                        z_res = indicators[sym].update(float(bar.c))
+                        m_res = macd_indicators[sym].update(float(bar.c))
+                        
+                        final_signal = None
+                        if z_res.get('signal') == 'long':
+                            final_signal = 'long'
+                        elif z_res.get('signal') == 'short':
+                            final_signal = 'short'
+                        
+                        bar.indicators = {**z_res, **m_res, "signal": final_signal}
 
             history_padding = warmup_minutes
             for sym, bars in bars_by_symbol.items():
-                end = min(safe_cursor, len(bars))
-                start_i = max(0, end - 200 - history_padding)
+                # Correctly calculate slicing indices relative to the 'start' time
+                # 'safe_cursor' is roughly where the playback should start (200 bars in)
+                # But if we want the chart to end exactly at 'start' time, we need to find that index.
+                
+                # If start_dt is provided, we want the init bars to end exactly at start_dt
+                target_end_index = safe_cursor
+                if start_dt:
+                     # Find the index of the bar closest to start_dt
+                     for idx, bar in enumerate(bars):
+                         bar_dt = datetime.fromisoformat(bar.t.replace("Z", "+00:00"))
+                         if bar_dt >= start_dt:
+                             target_end_index = idx
+                             break
+                     else:
+                         target_end_index = len(bars)
+                
+                end = target_end_index
+                start_i = max(0, end - 200) # Show 200 bars history
                 init = bars[start_i:end]
+                
+                # Update i to continue from where init left off
+                safe_cursor = end 
+                
                 await ws.send_json(
                     StreamInitMessage(type="init", mode="playback", symbol=sym, bars=init, cursor=end).model_dump()
                 )
@@ -213,10 +288,61 @@ def create_app() -> FastAPI:
                 any_sent = False
                 for sym, bars in bars_by_symbol.items():
                     if i < len(bars):
+                        bar = bars[i]
                         await ws.send_json(
-                            StreamBarMessage(type="bar", mode="playback", symbol=sym, bar=bars[i], i=i).model_dump()
+                            StreamBarMessage(type="bar", mode="playback", symbol=sym, bar=bar, i=i).model_dump()
                         )
                         any_sent = True
+                        
+                        if bar.indicators and bar.indicators.get("signal"):
+                            try:
+                                daily_list = daily_bars.get(sym, [])
+                                df_daily = pd.DataFrame([b.model_dump() for b in daily_list])
+                                if not df_daily.empty:
+                                    df_daily['timestamp'] = pd.to_datetime(df_daily['t'])
+                                    df_daily.set_index('timestamp', inplace=True)
+                                    df_daily.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+                                else:
+                                    df_daily = None
+
+                                start_slice = max(0, i - 300)
+                                intraday_slice = bars[start_slice : i+1]
+                                df_intraday = pd.DataFrame([b.model_dump() for b in intraday_slice])
+                                if not df_intraday.empty:
+                                    df_intraday['timestamp'] = pd.to_datetime(df_intraday['t'])
+                                    df_intraday.set_index('timestamp', inplace=True)
+                                    df_intraday.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+                                    df_intraday['symbol'] = sym
+                                    if 'indicators' in df_intraday.columns:
+                                        df_intraday.drop(columns=['indicators'], inplace=True)
+                                else:
+                                    df_intraday = None
+                                
+                                if df_intraday is not None:
+                                    analysis_req = LLMAnalysisRequest(
+                                        symbol=sym,
+                                        current_time=bar.t
+                                    )
+                                    
+                                    llm_res = await analysis_service.analyze_signal(
+                                        analysis_req,
+                                        preloaded_daily_bars=df_daily,
+                                        preloaded_intraday_bars=df_intraday
+                                    )
+                                    
+                                    await ws.send_json(
+                                        StreamAnalysisMessage(
+                                            type="analysis", 
+                                            mode="playback", 
+                                            symbol=sym, 
+                                            result=llm_res
+                                        ).model_dump()
+                                    )
+                                
+                            except Exception as e:
+                                print(f"Auto-Analysis failed for {sym}: {e}")
+                                pass
+
                 if not any_sent:
                     break
                 i += 1

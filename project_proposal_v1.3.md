@@ -26,18 +26,38 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 LLM 必须返回严格的 **JSON 格式** 数据。
 **示例 JSON Payload**:
 ```json
+### 4. LLM 结构化输出 Schema (JSON)
+
+为了支持复杂的交易决策逻辑，LLM 的输出将严格遵循以下 JSON Schema。这确保了系统能准确解析 LLM 的意图（买入、观望、追单或条件单）。
+
+```json
 {
-  "is_valid_buy_point": true,
-  "confidence": 0.92,
-  "reasoning": "Volume surge confirms the Z-score breakout; price is closing above upper Bollinger Band.",
-  "action_plan": {
-    "option_type": "call",
-    "strike_price": 346.00,
-    "option_stop_loss": 1.20,
-    "option_take_profit": 2.50,
-    "underlying_trigger_price": 345.50
+  "timestamp": "2024-01-01T12:00:00Z",
+  "symbol": "TICKER",
+  
+  // 核心决策动作
+  // 1. buy_long: 确认突破有效，做多 (Call)
+  // 2. buy_short: 确认跌破有效，做空 (Put)
+  // 3. ignore: 噪音波动，忽略
+  // 4. follow_up: 观察中，下一分钟再看 (例如：正在形成十字星，需要下一根确认)
+  // 5. check_when_condition_meet: 挂单模式 (例如：现在价格 100，如果突破 101 再叫我)
+  "action": "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet",
+  
+  // 置信度 (0.0 - 1.0)
+  "confidence": 0.85,
+  
+  // 决策理由 (简明扼要，支持 Markdown)
+  "reasoning": "Z-Score breakout confirmed with increasing volume. MACD histogram expanding. No immediate resistance overhead.",
+  
+  // [Scenario B] 仅在 action 为 "check_when_condition_meet" 时有效
+  // 意图：告诉系统设置一个本地触发器，一旦价格触及此位，立即再次唤醒 LLM
+  "watch_condition": {
+    "trigger_price": 347.50,
+    "direction": "above" | "below", // "above": 突破时触发, "below": 跌破时触发
+    "expiry_minutes": 30 // 这个条件的有效期，超过30分钟未触发则失效
   }
 }
+```
 ```
 
 ## 3. 数据基础设施
@@ -94,6 +114,10 @@ LLM 必须返回严格的 **JSON 格式** 数据。
       - **K线图表**: 黑色底色，K线采用高亮红绿配色。
       - **实时指标**: 动态叠加 EMA, Bollinger Bands, Support/Resistance Levels。
       - **交互**: 支持缩放、拖拽，随回放进度自动滚动。
+      - **关键 K 线特效 (Key Bar Highlight)**:
+        - **视觉交互**: 针对算法识别的"关键柱"（Key Bar），施加瞬时视觉增强。
+        - **动画设计**: 柱体执行单次"高亮闪烁"（Flash）或"呼吸"效果，边缘泛起霓虹光晕（Neon Glow）。
+        - **持续时间**: 动画持续约 1.5 秒后自动消失，K 线恢复标准红/绿状态，确保图表长期整洁。
     - **右侧：AI 智囊 (AI Copilot)**:
       - **对话流**: 玻璃面板容器。AI 的分析结果以对话气泡形式呈现，模拟打字机效果。
       - **内容**: 实时同步显示对左侧当前 K 线形态的分析、趋势预测及操作建议。
