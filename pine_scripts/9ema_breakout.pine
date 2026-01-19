@@ -1,0 +1,66 @@
+//@version=5
+indicator("9 EMA breakout strategy", overlay=true)
+
+// --- 0. 参数设置 ---
+group_main = "核心策略设置"
+ema_len     = input.int(9, "EMA 周期 (趋势线)", group=group_main)
+len_vol     = input.int(20, "波动率参考周期 (ATR思路)", group=group_main)
+mult_vol    = input.float(1, "突破波动倍数 (>1.5x)", step=0.1, group=group_main) 
+
+group_filter = "验证过滤设置"
+len_vlm     = input.int(20, "成交量均线周期", group=group_filter)
+mult_vlm    = input.float(0.5, "成交量倍数", step=0.1, group=group_filter) 
+
+// --- 1. 基础数据计算 ---
+// 1.1 9EMA
+ema_val = ta.ema(close, ema_len)
+
+// 1.2 波动率 (使用 ATR 思路：计算实体或收盘变动的均值)
+change_1m = math.abs(close - close[1]) 
+avg_volatility = ta.sma(change_1m, len_vol)
+vol_ratio = avg_volatility != 0 ? change_1m / avg_volatility : 0 
+
+// 1.3 成交量
+vol_sma = ta.sma(volume, len_vlm)
+vlm_ratio = vol_sma != 0 ? volume / vol_sma : 0 
+
+// 1.4 VWAP (仅作视觉参考)
+vwap_val = ta.vwap(close)
+
+// --- 2. 核心触发逻辑 (9EMA 突破) ---
+
+// 2.1 判定是否穿过 EMA
+// 多头突破：开盘在EMA下方 (或附近)，收盘有力地站上 EMA
+cross_up = (open < ema_val) and (close > ema_val)
+// 空头突破：开盘在EMA上方，收盘有力地跌破 EMA
+cross_down = (open > ema_val) and (close < ema_val)
+
+// 2.2 判定力度是否达标 (用户条件：1.5倍平均波动)
+is_powerful = vol_ratio > mult_vol
+
+// 2.3 判定是否有量 (防止假突破)
+is_active_volume = vlm_ratio > mult_vlm
+
+// 2.4 综合触发
+// 逻辑：只有当 K线穿过EMA 且 波动有力 且 有量 时才触发
+bull_trigger = cross_up and is_powerful and is_active_volume and barstate.isconfirmed
+bear_trigger = cross_down and is_powerful and is_active_volume and barstate.isconfirmed
+
+// 任何一种触发
+trigger_condition = bull_trigger or bear_trigger
+
+// --- 3. 警报与信号发射 (无冷却，满足即触发) ---
+if trigger_condition
+    string direction = bull_trigger ? "BULL Breakout" : "BEAR Breakout"
+    // 这里的警报会针对每一根满足条件的K线触发
+    alert("Call LLM: " + direction + " with Volatility " + str.tostring(vol_ratio, "#.##") + "x", alert.freq_once_per_bar_close)
+
+// --- 4. 可视化 (Visualization) ---
+// 竖条背景填充 (Regime Shading)
+// 只要满足条件就显示背景色
+bg_color = bull_trigger ? color.new(color.green, 85) : bear_trigger ? color.new(color.red, 85) : na
+bgcolor(bg_color, title="Breakout Signal Background")
+
+// 辅助标记
+plotshape(bull_trigger, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.tiny, title="Bull Triangle")
+plotshape(bear_trigger, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, title="Bear Triangle")

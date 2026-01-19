@@ -47,7 +47,7 @@ export function AICopilot({
           </div>
           <div>
             <h3 className="font-bold text-white">AI Copilot</h3>
-            <p className="text-xs text-white/50">Gemini 3 Pro • Realtime Analysis</p>
+            <p className="text-xs text-white/50">Realtime Analysis</p>
           </div>
         </div>
       </div>

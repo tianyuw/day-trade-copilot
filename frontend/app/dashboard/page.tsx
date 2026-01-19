@@ -30,6 +30,25 @@ function toRFC3339FromPSTInput(v: string): string | null {
   return d.toISOString()
 }
 
+function toEpochSeconds(rfc3339: string): number {
+  return Math.floor(new Date(rfc3339).getTime() / 1000)
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0")
+}
+
+function formatPSTFromUtcSeconds(utcSeconds: number): string {
+  const pstMs = utcSeconds * 1000 - 8 * 60 * 60 * 1000
+  const d = new Date(pstMs)
+  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+}
+
+function formatPSTFromRFC3339(rfc3339: string): string {
+  if (!rfc3339) return ""
+  return formatPSTFromUtcSeconds(toEpochSeconds(rfc3339))
+}
+
 function AICopilotPanel({ symbol, messages }: { symbol: string; messages: ChatMessage[] }) {
   return <AICopilot symbol={symbol} messages={messages} />
 }
@@ -48,7 +67,6 @@ export default function DashboardPage() {
   
   // AI State
   const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
-  const [isAnalyzing, setIsAnalyzing] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
@@ -60,21 +78,12 @@ export default function DashboardPage() {
       {
         role: "system",
         content: `AI Copilot initialized for ${selectedSymbol}. Monitoring price action...`,
-        time: new Date().toLocaleTimeString(),
+        time: formatPSTFromRFC3339(new Date().toISOString()),
       },
     ])
   }, [selectedSymbol, resetToken])
 
-  const handlePause = () => {
-      setIsPlaying(false)
-  }
-  
-  const handleResume = () => {
-      setIsPlaying(true)
-  }
-  
   const handleAnalyze = async (time: string) => {
-      setIsAnalyzing(true)
       try {
           const base = process.env.NEXT_PUBLIC_BACKEND_API ?? `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
           const res = await fetch(`${base}/api/analyze`, {
@@ -95,7 +104,7 @@ export default function DashboardPage() {
               {
                   role: "ai",
                   content: data, // Pass the whole object
-                  time: new Date().toLocaleTimeString(),
+                  time: formatPSTFromRFC3339(data?.timestamp ?? time),
                   type: "analysis"
               }
           ])
@@ -107,11 +116,9 @@ export default function DashboardPage() {
               {
                   role: "system",
                   content: `Analysis Error: ${e instanceof Error ? e.message : 'Unknown error'}`,
-                  time: new Date().toLocaleTimeString(),
+                  time: formatPSTFromRFC3339(new Date().toISOString()),
               }
           ])
-      } finally {
-          setIsAnalyzing(false)
       }
   }
 
@@ -201,7 +208,7 @@ export default function DashboardPage() {
             {
                 role: "ai",
                 content: msg.result, 
-                time: new Date().toLocaleTimeString(),
+                time: formatPSTFromRFC3339(msg.result?.timestamp ?? new Date().toISOString()),
                 type: "analysis"
             }
           ])
@@ -358,9 +365,6 @@ export default function DashboardPage() {
                    prevClose={prevClose}
                    className="h-full w-full !bg-transparent !shadow-none !ring-0 !backdrop-blur-none" 
                    status={isPlaying ? "hot" : "normal"}
-                   isAnalyzing={isAnalyzing}
-                   onPause={handlePause}
-                   onResume={handleResume}
                    onAnalyze={handleAnalyze}
                 />
                 

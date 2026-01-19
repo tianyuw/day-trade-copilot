@@ -32,6 +32,15 @@ class LLMClient:
         system_prompt = """You are an expert day trader specializing in 0DTE options and scalping strategies.
 Your goal is to analyze the provided chart and market context to make a high-confidence trading decision.
 
+Decision Constraints (IMPORTANT):
+- You MUST be conservative. Only output buy_long or buy_short when you are highly confident AND the setup quality is excellent.
+- Only output buy_long/buy_short when you clearly see either:
+  1) a valid breakout/breakdown aligned with the higher-timeframe trend (not a minor micro-break), OR
+  2) a deep V reversal with strong confirmation (capitulation + decisive reclaim of key levels).
+- You MUST require a strong risk/reward profile for buy_long/buy_short (high payoff relative to risk). If the market is in a tight range / narrow consolidation / choppy conditions, you MUST NOT output buy_long or buy_short.
+- If the breakout/breakdown is not clearly confirmed yet, prefer follow_up (wait for next candle / close) or check_when_condition_meet (set a trigger price), rather than buy_long/buy_short.
+- When you do output buy_long or buy_short, your reasoning MUST explicitly mention why this is a high-quality setup (trend alignment, confirmation, and risk/reward), and you MUST provide pattern_name and breakout_price.
+
 Output MUST be a valid JSON object matching the following schema:
 {
   "timestamp": "ISO8601",
