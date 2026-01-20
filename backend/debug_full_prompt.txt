@@ -1,0 +1,206 @@
+--- System Prompt ---
+You are an expert day trader specializing in 0DTE options and scalping strategies.
+Your goal is to analyze the provided chart and market context to make a high-confidence trading decision.
+
+Decision Constraints (IMPORTANT):
+- You MUST require a strong risk/reward profile for buy_long/buy_short (high payoff relative to risk).
+- If the breakout/breakdown is not clearly confirmed yet, prefer follow_up (wait for next candle / close) or check_when_condition_meet (set a trigger price), rather than buy_long/buy_short.
+- When you do output buy_long or buy_short, your reasoning MUST explicitly mention why this is a high-quality setup (trend alignment, confirmation, and risk/reward), and you MUST provide pattern_name and breakout_price.
+- Market Index Filter (MANDATORY):
+  - You MUST evaluate the provided Benchmark Context (Proxy Futures): QQQ (≈ NQ) and SPY (≈ ES).
+  - If you want to buy_long a stock but the benchmarks are showing a bearish structure and/or are below (and very close to) key resistance levels (as inferred from SMA20/50/100/200 and previous day high/low), you MUST NOT output buy_long. Use ignore, follow_up, or check_when_condition_meet instead.
+  - If you want to buy_short a stock but the benchmarks are showing a bullish structure and/or are above (and very close to) key support levels (as inferred from SMA20/50/100/200 and previous day high/low), you MUST NOT output buy_short. Use ignore, follow_up, or check_when_condition_meet instead.
+  - Your reasoning MUST explicitly cite at least one benchmark fact.
+
+Output MUST be a valid JSON object matching the following schema:
+{
+  "timestamp": "ISO8601",
+  "symbol": "TICKER",
+  "action": "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet",
+  "confidence": float (0.0-1.0),
+  "reasoning": "concise explanation",
+  "pattern_name": "string" (optional, required if action is buy_long/buy_short),
+  "breakout_price": float (optional, required if action is buy_long/buy_short),
+  "watch_condition": { "trigger_price": float, "direction": "above"|"below", "expiry_minutes": int } (optional, ONLY used when action is "check_when_condition_meet", otherwise null)
+}
+
+Action Definitions:
+- buy_long: Breakout confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Bull Flag Breakout") and "breakout_price".
+- buy_short: Breakdown confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Head and Shoulders Breakdown") and "breakout_price".
+- ignore: False breakout, low volume, hitting resistance/support, or chopping.
+- follow_up: Potential setup but need to wait for the next candle for confirmation.
+- check_when_condition_meet: Setup looks good but price needs to cross a specific level (e.g. key resistance/support) first. In this case, you MUST provide "watch_condition".
+
+
+--- User Prompt ---
+Analyze the following market context for NVDA at 2026-01-16T15:03:00Z.
+
+Market Context:
+
+Timestamp (PST): 2026-01-16 07:03:00
+Symbol: NVDA
+
+Daily Stats (Last 60 Days):
+- Daily Trend (Last 60 Days): 182.64, 181.16, 180.28, 182.16, 186.26, 191.49, 201.03, 207.04, 202.89, 202.49, 206.88, 198.69, 195.21, 188.08, 188.15, 199.05, 193.16, 193.80, 186.86, 190.17, 186.60, 181.36, 186.52, 180.64, 178.88, 182.55, 177.82, 180.26, 177.00, 179.92, 181.46, 179.59, 183.38, 182.41, 185.55, 184.97, 183.78, 180.93, 175.02, 176.29, 177.72, 170.94, 174.14, 180.99, 183.69, 189.21, 188.61, 190.53, 188.22, 187.54, 186.50, 188.85, 188.12, 187.24, 189.11, 185.04, 184.86, 184.94, 185.81, 183.14
+
+Previous Day Stats:
+- Close: 183.14
+- High: 184.46
+- Low: 180.80
+
+Intraday Stats:
+- Open: 188.53
+- Day High: 190.44
+- Day Low: 187.97
+- Current Price: 189.28
+
+Technical Indicators (Latest):
+- EMA9: 189.22
+- EMA21: 189.45
+- VWAP: 189.46
+- Bollinger Upper: 190.66
+- Bollinger Middle: 189.66
+- Bollinger Lower: 188.66
+- MACD DIF: -0.153
+- MACD DEA: -0.019
+- MACD Hist: -0.268
+
+Recent Price Action (Last 60 mins):
+- 14:04: O=188.62, H=188.63, L=188.50, C=188.56, V=6420.0
+- 14:05: O=188.56, H=188.60, L=188.51, C=188.60, V=9581.0
+- 14:06: O=188.60, H=188.67, L=188.60, C=188.67, V=29342.0
+- 14:07: O=188.66, H=188.75, L=188.64, C=188.71, V=26283.0
+- 14:08: O=188.71, H=188.72, L=188.68, C=188.71, V=12444.0
+- 14:09: O=188.71, H=188.73, L=188.70, C=188.70, V=8668.0
+- 14:10: O=188.67, H=188.67, L=188.61, C=188.63, V=10088.0
+- 14:11: O=188.62, H=188.64, L=188.53, C=188.58, V=12338.0
+- 14:12: O=188.57, H=188.62, L=188.55, C=188.62, V=5373.0
+- 14:13: O=188.60, H=188.65, L=188.56, C=188.56, V=6890.0
+- 14:14: O=188.57, H=188.59, L=188.51, C=188.52, V=7816.0
+- 14:15: O=188.56, H=188.56, L=188.48, C=188.49, V=8300.0
+- 14:16: O=188.49, H=188.60, L=188.47, C=188.56, V=7271.0
+- 14:17: O=188.57, H=188.57, L=188.50, C=188.50, V=4800.0
+- 14:18: O=188.54, H=188.59, L=188.51, C=188.56, V=8790.0
+- 14:19: O=188.58, H=188.70, L=188.58, C=188.64, V=11566.0
+- 14:20: O=188.63, H=188.67, L=188.63, C=188.65, V=7276.0
+- 14:21: O=188.66, H=188.69, L=188.64, C=188.68, V=7583.0
+- 14:22: O=188.66, H=188.70, L=188.63, C=188.63, V=11611.0
+- 14:23: O=188.64, H=188.64, L=188.59, C=188.62, V=10291.0
+- 14:24: O=188.65, H=188.65, L=188.53, C=188.53, V=9797.0
+- 14:25: O=188.46, H=188.53, L=188.00, C=188.21, V=80620.0
+- 14:26: O=188.24, H=188.47, L=188.24, C=188.40, V=24338.0
+- 14:27: O=188.41, H=188.79, L=188.35, C=188.73, V=45950.0
+- 14:28: O=188.73, H=189.41, L=188.71, C=189.15, V=231741.0
+- 14:29: O=189.15, H=189.16, L=188.95, C=189.05, V=63003.0
+- 14:30: O=189.05, H=189.50, L=188.69, C=189.33, V=12646760.0
+- 14:31: O=189.36, H=189.67, L=188.88, C=188.98, V=859310.0
+- 14:32: O=188.99, H=189.47, L=188.89, C=188.97, V=639518.0
+- 14:33: O=188.97, H=189.34, L=188.79, C=189.20, V=784131.0
+- 14:34: O=189.24, H=189.50, L=189.00, C=189.28, V=837988.0
+- 14:35: O=189.32, H=189.82, L=189.31, C=189.81, V=1118937.0
+- 14:36: O=189.82, H=190.33, L=189.78, C=190.09, V=2489547.0
+- 14:37: O=190.08, H=190.27, L=190.00, C=190.11, V=685668.0
+- 14:38: O=190.12, H=190.26, L=190.08, C=190.24, V=676313.0
+- 14:39: O=190.23, H=190.36, L=190.14, C=190.21, V=707786.0
+- 14:40: O=190.22, H=190.34, L=190.12, C=190.31, V=616852.0
+- 14:41: O=190.31, H=190.37, L=189.82, C=189.96, V=929852.0
+- 14:42: O=189.97, H=190.08, L=189.67, C=189.75, V=652133.0
+- 14:43: O=189.76, H=189.92, L=189.72, C=189.85, V=479834.0
+- 14:44: O=189.85, H=190.09, L=189.68, C=189.92, V=691080.0
+- 14:45: O=189.93, H=190.27, L=189.84, C=190.10, V=849992.0
+- 14:46: O=190.09, H=190.37, L=189.97, C=190.01, V=649788.0
+- 14:47: O=190.01, H=190.06, L=189.74, C=189.84, V=493876.0
+- 14:48: O=189.84, H=190.00, L=189.80, C=189.88, V=332648.0
+- 14:49: O=189.88, H=190.25, L=189.64, C=190.19, V=776228.0
+- 14:50: O=190.25, H=190.34, L=189.89, C=190.07, V=623040.0
+- 14:51: O=190.13, H=190.41, L=190.06, C=190.06, V=633851.0
+- 14:52: O=190.06, H=190.17, L=189.98, C=190.17, V=360922.0
+- 14:53: O=190.17, H=190.36, L=190.03, C=190.21, V=472495.0
+- 14:54: O=190.21, H=190.44, L=190.06, C=190.07, V=734769.0
+- 14:55: O=190.06, H=190.12, L=189.51, C=189.54, V=655957.0
+- 14:56: O=189.54, H=189.66, L=189.38, C=189.45, V=918884.0
+- 14:57: O=189.45, H=189.55, L=189.40, C=189.43, V=367660.0
+- 14:58: O=189.43, H=189.50, L=189.23, C=189.40, V=618351.0
+- 14:59: O=189.40, H=189.42, L=189.10, C=189.24, V=458649.0
+- 15:00: O=189.22, H=189.26, L=188.93, C=189.02, V=733733.0
+- 15:01: O=189.01, H=189.05, L=188.48, C=188.48, V=1150265.0
+- 15:02: O=188.48, H=188.87, L=188.46, C=188.86, V=881341.0
+- 15:03: O=188.85, H=189.30, L=188.79, C=189.28, V=671741.0
+
+Benchmark Context (Proxy Futures):
+
+- QQQ (≈ NQ)
+  - Current Price: 622.64
+  - Previous Day High: 626.08
+  - Previous Day Low: 618.88
+  - Daily SMA20: 620.579
+  - Daily SMA50: 616.2502
+  - Daily SMA100: 607.5801
+  - Daily SMA200: 565.62505
+  - Recent 1m Price Action (Last 20 mins):
+    - 14:44: O=624.92, H=624.94, L=624.37, C=624.38, V=211808.0
+    - 14:45: O=624.39, H=624.95, L=624.23, C=624.71, V=429530.0
+    - 14:46: O=624.71, H=624.95, L=624.67, C=624.76, V=139726.0
+    - 14:47: O=624.75, H=624.79, L=624.52, C=624.55, V=163055.0
+    - 14:48: O=624.58, H=624.74, L=624.37, C=624.46, V=224255.0
+    - 14:49: O=624.47, H=624.47, L=624.07, C=624.40, V=118200.0
+    - 14:50: O=624.41, H=624.62, L=624.23, C=624.33, V=149549.0
+    - 14:51: O=624.33, H=624.40, L=624.08, C=624.17, V=180831.0
+    - 14:52: O=624.17, H=624.26, L=623.91, C=624.10, V=206407.0
+    - 14:53: O=624.10, H=624.20, L=623.73, C=623.77, V=171852.0
+    - 14:54: O=623.75, H=623.98, L=623.33, C=623.55, V=372111.0
+    - 14:55: O=623.54, H=623.59, L=623.06, C=623.08, V=622412.0
+    - 14:56: O=623.10, H=623.28, L=622.74, C=622.76, V=292553.0
+    - 14:57: O=622.75, H=622.85, L=622.63, C=622.65, V=220026.0
+    - 14:58: O=622.65, H=622.83, L=622.52, C=622.71, V=267695.0
+    - 14:59: O=622.72, H=622.84, L=622.14, C=622.19, V=306885.0
+    - 15:00: O=622.19, H=622.37, L=621.96, C=622.16, V=384789.0
+    - 15:01: O=622.16, H=622.23, L=621.77, C=621.88, V=300889.0
+    - 15:02: O=621.88, H=622.25, L=621.77, C=622.12, V=281139.0
+    - 15:03: O=622.12, H=622.66, L=622.01, C=622.64, V=408459.0
+
+- SPY (≈ ES)
+  - Current Price: 692.34
+  - Previous Day High: 694.25
+  - Previous Day Low: 690.10
+  - Daily SMA20: 688.3185000000001
+  - Daily SMA50: 681.1144
+  - Daily SMA100: 672.3512
+  - Daily SMA200: 633.8101
+  - Recent 1m Price Action (Last 20 mins):
+    - 14:44: O=693.45, H=693.46, L=693.11, C=693.13, V=252688.0
+    - 14:45: O=693.14, H=693.80, L=693.14, C=693.61, V=363744.0
+    - 14:46: O=693.60, H=693.83, L=693.54, C=693.83, V=204371.0
+    - 14:47: O=693.82, H=693.86, L=693.44, C=693.47, V=151640.0
+    - 14:48: O=693.48, H=693.62, L=693.36, C=693.48, V=145571.0
+    - 14:49: O=693.48, H=693.50, L=693.27, C=693.39, V=127924.0
+    - 14:50: O=693.41, H=693.49, L=693.23, C=693.35, V=124682.0
+    - 14:51: O=693.34, H=693.45, L=693.17, C=693.31, V=156224.0
+    - 14:52: O=693.32, H=693.35, L=693.12, C=693.22, V=200582.0
+    - 14:53: O=693.22, H=693.27, L=692.91, C=692.92, V=165222.0
+    - 14:54: O=692.92, H=693.05, L=692.68, C=692.88, V=286224.0
+    - 14:55: O=692.87, H=692.88, L=692.57, C=692.60, V=285582.0
+    - 14:56: O=692.59, H=692.78, L=692.45, C=692.46, V=350423.0
+    - 14:57: O=692.47, H=692.52, L=692.33, C=692.35, V=197177.0
+    - 14:58: O=692.34, H=692.50, L=692.20, C=692.26, V=298701.0
+    - 14:59: O=692.26, H=692.35, L=691.93, C=691.96, V=387894.0
+    - 15:00: O=691.96, H=692.08, L=691.78, C=691.88, V=298257.0
+    - 15:01: O=691.87, H=691.92, L=691.60, C=691.64, V=286004.0
+    - 15:02: O=691.63, H=692.02, L=691.59, C=691.89, V=426546.0
+    - 15:03: O=691.90, H=692.35, L=691.83, C=692.34, V=477775.0
+
+
+Chart Description:
+The attached chart contains three panels:
+1. Top Panel (Price Action): 
+   - Candles: Cyan=Up, Red=Down
+   - Overlays: Green Line=EMA9, Red Line=EMA21, White Line=VWAP
+   - Bollinger Bands: Purple=Upper, Blue=Middle, Yellow=Lower
+2. Middle Panel (Volume): Bars
+3. Bottom Panel (MACD):
+   - White Line = DIF
+   - Yellow Line = DEA
+   - Green/Red Bars = Histogram
+
+Based on the chart and context, provide your trading decision JSON.
+

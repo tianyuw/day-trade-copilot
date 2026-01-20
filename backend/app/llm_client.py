@@ -3,6 +3,7 @@ import json
 from .schemas import LLMAnalysisResponse, LLMAnalysisRequest
 from .google_api_client import GoogleAPIClient
 from .openrouter_api_client import OpenRouterAPIClient
+from .llm_prompts import get_llm_system_prompt
 
 class LLMClient:
     def __init__(self):
@@ -15,12 +16,12 @@ class LLMClient:
             self.client = GoogleAPIClient()
             self.use_google_native = True
             # Default model for Google Native
-            self.model_name = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")
+            self.model_name = os.getenv("GOOGLE_MODEL", "gemini-3-flash-preview")
         else:
             # 2. Fallback to OpenRouter
             print("Using OpenRouter API")
             self.client = OpenRouterAPIClient()
-            self.model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
+            self.model = os.getenv("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 
     async def analyze_chart(
         self, 
@@ -29,37 +30,7 @@ class LLMClient:
         context_text: str
     ) -> LLMAnalysisResponse:
         
-        system_prompt = """You are an expert day trader specializing in 0DTE options and scalping strategies.
-Your goal is to analyze the provided chart and market context to make a high-confidence trading decision.
-
-Decision Constraints (IMPORTANT):
-- You MUST be conservative. Only output buy_long or buy_short when you are highly confident AND the setup quality is excellent.
-- Only output buy_long/buy_short when you clearly see either:
-  1) a valid breakout/breakdown aligned with the higher-timeframe trend (not a minor micro-break), OR
-  2) a deep V reversal with strong confirmation (capitulation + decisive reclaim of key levels).
-- You MUST require a strong risk/reward profile for buy_long/buy_short (high payoff relative to risk). If the market is in a tight range / narrow consolidation / choppy conditions, you MUST NOT output buy_long or buy_short.
-- If the breakout/breakdown is not clearly confirmed yet, prefer follow_up (wait for next candle / close) or check_when_condition_meet (set a trigger price), rather than buy_long/buy_short.
-- When you do output buy_long or buy_short, your reasoning MUST explicitly mention why this is a high-quality setup (trend alignment, confirmation, and risk/reward), and you MUST provide pattern_name and breakout_price.
-
-Output MUST be a valid JSON object matching the following schema:
-{
-  "timestamp": "ISO8601",
-  "symbol": "TICKER",
-  "action": "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet",
-  "confidence": float (0.0-1.0),
-  "reasoning": "concise explanation",
-  "pattern_name": "string" (optional, required if action is buy_long/buy_short),
-  "breakout_price": float (optional, required if action is buy_long/buy_short),
-  "watch_condition": { "trigger_price": float, "direction": "above"|"below", "expiry_minutes": int } (optional, ONLY used when action is "check_when_condition_meet", otherwise null)
-}
-
-Action Definitions:
-- buy_long: Breakout confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Bull Flag Breakout") and "breakout_price".
-- buy_short: Breakdown confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Head and Shoulders Breakdown") and "breakout_price".
-- ignore: False breakout, low volume, hitting resistance/support, or chopping.
-- follow_up: Potential setup but need to wait for the next candle for confirmation.
-- check_when_condition_meet: Setup looks good but price needs to cross a specific level (e.g. key resistance/support) first. In this case, you MUST provide "watch_condition".
-"""
+        system_prompt = get_llm_system_prompt()
 
         user_content_text = f"""Analyze the following market context for {request.symbol} at {request.current_time}.
 
@@ -90,6 +61,11 @@ Based on the chart and context, provide your trading decision JSON.
             
             # Parse JSON and validate with Pydantic
             data = json.loads(content)
+            if isinstance(data, list):
+                if len(data) == 1 and isinstance(data[0], dict):
+                    data = data[0]
+                else:
+                    raise ValueError("Model returned a JSON array; expected a single JSON object")
             
             # Ensure required fields that might be missing from LLM are present or set defaults
             import uuid

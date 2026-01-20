@@ -12,6 +12,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from app.settings import get_settings
 from app.analysis_service import AnalysisService
 from app.schemas import LLMAnalysisRequest
+from app.llm_prompts import get_llm_system_prompt
 from alpaca.data.historical import StockHistoricalDataClient
 
 async def main():
@@ -34,7 +35,7 @@ async def main():
 
     # Target: NVDA @ 2026-01-15 08:38 PST
     # Convert to UTC ISO format
-    pst_time = datetime(2026, 1, 15, 8, 38, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    pst_time = datetime(2026, 1, 16, 7, 3, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
     utc_time = pst_time.astimezone(ZoneInfo("UTC"))
     utc_iso = utc_time.strftime('%Y-%m-%dT%H:%M:%SZ')
     
@@ -63,37 +64,7 @@ async def main():
             captured_image = img_b64
             
             # Reconstruct the full prompt exactly as LLMClient does
-            system_prompt = """You are an expert day trader specializing in 0DTE options and scalping strategies.
-Your goal is to analyze the provided chart and market context to make a high-confidence trading decision.
-
-Decision Constraints (IMPORTANT):
-- You MUST be conservative. Only output buy_long or buy_short when you are highly confident AND the setup quality is excellent.
-- Only output buy_long/buy_short when you clearly see either:
-  1) a valid breakout/breakdown aligned with the higher-timeframe trend (not a minor micro-break), OR
-  2) a deep V reversal with strong confirmation (capitulation + decisive reclaim of key levels).
-- You MUST require a strong risk/reward profile for buy_long/buy_short (high payoff relative to risk). If the market is in a tight range / narrow consolidation / choppy conditions, you MUST NOT output buy_long or buy_short.
-- If the breakout/breakdown is not clearly confirmed yet, prefer follow_up (wait for next candle / close) or check_when_condition_meet (set a trigger price), rather than buy_long/buy_short.
-- When you do output buy_long or buy_short, your reasoning MUST explicitly mention why this is a high-quality setup (trend alignment, confirmation, and risk/reward), and you MUST provide pattern_name and breakout_price.
-
-Output MUST be a valid JSON object matching the following schema:
-{
-  "timestamp": "ISO8601",
-  "symbol": "TICKER",
-  "action": "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet",
-  "confidence": float (0.0-1.0),
-  "reasoning": "concise explanation",
-  "pattern_name": "string" (optional, required if action is buy_long/buy_short),
-  "breakout_price": float (optional, required if action is buy_long/buy_short),
-  "watch_condition": { "trigger_price": float, "direction": "above"|"below", "expiry_minutes": int } (optional, ONLY used when action is "check_when_condition_meet", otherwise null)
-}
-
-Action Definitions:
-- buy_long: Breakout confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Bull Flag Breakout") and "breakout_price".
-- buy_short: Breakdown confirmed, good momentum, clear entry. MUST specify "pattern_name" (e.g. "Head and Shoulders Breakdown") and "breakout_price".
-- ignore: False breakout, low volume, hitting resistance/support, or chopping.
-- follow_up: Potential setup but need to wait for candle close or next candle for confirmation.
-- check_when_condition_meet: Setup looks good but price needs to cross a specific level (e.g. key resistance) first. In this case, you MUST provide "watch_condition".
-"""
+            system_prompt = get_llm_system_prompt()
 
             user_content_text = f"""Analyze the following market context for {req.symbol} at {req.current_time}.
 
@@ -117,10 +88,16 @@ Based on the chart and context, provide your trading decision JSON.
             
             print("\n=== FULL Prompt Sent to LLM ===")
             print("--- System Prompt ---")
-            print(system_prompt)
+            print(system_prompt, flush=True)
             print("\n--- User Prompt ---")
-            print(user_content_text)
+            print(user_content_text, flush=True)
             print("====================================\n")
+
+            full_prompt = f"--- System Prompt ---\n{system_prompt}\n\n--- User Prompt ---\n{user_content_text}\n"
+            prompt_path = os.path.abspath("debug_full_prompt.txt")
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(full_prompt)
+            print(f"[SUCCESS] Full prompt saved to: {prompt_path}\n", flush=True)
             
             # Call original
             return await original_analyze(req, img_b64, context)

@@ -18,6 +18,61 @@ class AnalysisService:
         self.alpaca = alpaca_client
         self.llm_client = LLMClient()
 
+    async def _get_bars_df(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> pd.DataFrame:
+        if hasattr(self.alpaca, "get_bars"):
+            start_iso = start.isoformat().replace("+00:00", "Z")
+            end_iso = end.isoformat().replace("+00:00", "Z")
+            data = await self.alpaca.get_bars([symbol], timeframe=timeframe, start=start_iso, end=end_iso, limit=limit)
+            bars = data.get(symbol, [])
+            df = pd.DataFrame([b.model_dump() for b in bars])
+            if df.empty:
+                return df
+            df["timestamp"] = pd.to_datetime(df["t"])
+            df.set_index("timestamp", inplace=True)
+            df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}, inplace=True)
+            df.sort_index(inplace=True)
+            return df
+
+        if hasattr(self.alpaca, "get_stock_bars"):
+            tf = TimeFrame.Day if timeframe == "1Day" else TimeFrame.Minute
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start,
+                end=end,
+                limit=limit,
+            )
+            df = self.alpaca.get_stock_bars(req).df
+            if df is None or df.empty:
+                return pd.DataFrame()
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df.set_index("timestamp", inplace=True)
+            df.sort_index(inplace=True)
+            return df
+
+        raise AttributeError("Alpaca client must provide get_bars or get_stock_bars")
+
+    def _sma_last(self, close: pd.Series, window: int) -> float | None:
+        if close is None or close.empty:
+            return None
+        if len(close) < window:
+            return None
+        v = close.rolling(window=window).mean().iloc[-1]
+        try:
+            return float(v)
+        except Exception:
+            return None
+
     async def analyze_signal(
         self, 
         request: LLMAnalysisRequest, 
@@ -312,10 +367,50 @@ Technical Indicators (Latest):
 
 Recent Price Action (Last 60 mins):
 """
-        # Add last 60 bars details
         for b in bars_with_indicators[-60:]:
             t_str = b['t'].strftime('%H:%M')
             context_text += f"- {t_str}: O={b['o']:.2f}, H={b['h']:.2f}, L={b['l']:.2f}, C={b['c']:.2f}, V={b['v']}\n"
+
+        context_text += "\nBenchmark Context (Proxy Futures):\n"
+        benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
+        benchmark_alias = {"QQQ": "NQ", "SPY": "ES", "DIA": "YM", "IWM": "RTY"}
+        bench_daily_end = current_dt
+        bench_daily_start = current_dt - timedelta(days=450)
+        bench_intraday_start = current_dt - timedelta(minutes=300)
+
+        for bsym in benchmark_symbols:
+            df_b_daily = await self._get_bars_df(bsym, "1Day", bench_daily_start, bench_daily_end, 500)
+            df_b_intra = await self._get_bars_df(bsym, "1Min", bench_intraday_start, current_dt, 1000)
+
+            b_last = float(df_b_intra["close"].iloc[-1]) if not df_b_intra.empty else (float(df_b_daily["close"].iloc[-1]) if not df_b_daily.empty else 0.0)
+            b_prev_high = float(df_b_daily["high"].iloc[-1]) if not df_b_daily.empty and "high" in df_b_daily.columns else 0.0
+            b_prev_low = float(df_b_daily["low"].iloc[-1]) if not df_b_daily.empty and "low" in df_b_daily.columns else 0.0
+
+            b_sma20 = self._sma_last(df_b_daily["close"], 20) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma50 = self._sma_last(df_b_daily["close"], 50) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma100 = self._sma_last(df_b_daily["close"], 100) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma200 = self._sma_last(df_b_daily["close"], 200) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+
+            alias = benchmark_alias.get(bsym)
+            alias_text = f"(≈ {alias})" if alias else ""
+            context_text += f"""
+- {bsym} {alias_text}
+  - Current Price: {b_last:.2f}
+  - Previous Day High: {b_prev_high:.2f}
+  - Previous Day Low: {b_prev_low:.2f}
+  - Daily SMA20: {b_sma20 if b_sma20 is not None else "N/A"}
+  - Daily SMA50: {b_sma50 if b_sma50 is not None else "N/A"}
+  - Daily SMA100: {b_sma100 if b_sma100 is not None else "N/A"}
+  - Daily SMA200: {b_sma200 if b_sma200 is not None else "N/A"}
+  - Recent 1m Price Action (Last 20 mins):
+"""
+            if not df_b_intra.empty:
+                df_tail = df_b_intra.tail(20)
+                for ts_i, r_i in df_tail.iterrows():
+                    t_str = ts_i.strftime('%H:%M')
+                    context_text += f"    - {t_str}: O={float(r_i['open']):.2f}, H={float(r_i['high']):.2f}, L={float(r_i['low']):.2f}, C={float(r_i['close']):.2f}, V={float(r_i.get('volume', 0))}\n"
+            else:
+                context_text += "    - N/A\n"
 
         # 5. Call LLM
         response = await self.llm_client.analyze_chart(request, chart_base64, context_text)
