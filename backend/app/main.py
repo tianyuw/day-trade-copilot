@@ -20,6 +20,7 @@ from .schemas import (
     StreamAnalysisMessage,
     LLMAnalysisRequest,
     LLMAnalysisResponse,
+    TradingSettings,
 )
 from .settings import get_settings
 from .indicators import ZScoreMomentum, MACD
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     assets_lock = asyncio.Lock()
     assets_cache: dict[str, object] = {"expires_at": 0.0, "assets": []}
     assets_ttl_seconds = 6 * 60 * 60
+    paper_auto_trade_enabled = False
 
     app = FastAPI(title="0DTE Copilot API", version="0.1.0")
     app.add_middleware(
@@ -47,6 +49,16 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     async def health() -> dict:
         return {"ok": True}
+
+    @app.get("/api/settings/trading", response_model=TradingSettings)
+    async def get_trading_settings() -> TradingSettings:
+        return TradingSettings(paper_auto_trade_enabled=paper_auto_trade_enabled)
+
+    @app.post("/api/settings/trading", response_model=TradingSettings)
+    async def set_trading_settings(payload: TradingSettings) -> TradingSettings:
+        nonlocal paper_auto_trade_enabled
+        paper_auto_trade_enabled = bool(payload.paper_auto_trade_enabled)
+        return TradingSettings(paper_auto_trade_enabled=paper_auto_trade_enabled)
 
     @app.get("/api/market/status")
     async def market_status() -> dict:

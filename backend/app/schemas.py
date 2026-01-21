@@ -91,3 +91,7 @@ class AIVerificationRequest(BaseModel):
     indicators: dict[str, Any] | None = None
     option_chain: dict[str, Any] | None = None
     rolling_summary: str | None = None
+
+
+class TradingSettings(BaseModel):
+    paper_auto_trade_enabled: bool = False

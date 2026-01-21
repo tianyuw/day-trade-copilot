@@ -19,36 +19,36 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
   1. **市场数据**: 过去 30 分钟的 OHLCV 序列。
   2. **技术指标**: 过去 30 分钟的 EMA9, EMA21, Volume, VWAP, Bollinger Bands 序列。
   3. **视觉数据**: 生成的当日盘中完整的 K 线图图片，叠加指标、压力位（Resistance）和支撑位（Support）及量化算法标记出的突破点位。
-  4. **（阶段二）期权链数据 (Option Chain)**: 暂不启用；先用正股把入场/出场与 PnL 闭环打通后，再引入期权链用于合约选择与滑点/流动性约束。
+  4. **期权链数据 (Option Chain)**: 用于在 `buy_long/buy_short` 时选择合约（到期日、行权价）并校验点差/流动性约束。
 - **验证任务**:
   - 产出结构化 `action`：`buy_long / buy_short / ignore / follow_up / check_when_condition_meet`。
   - 若 `action = follow_up`：按 LLM 指示在**下一根 1m K 线收盘**继续验证（再次调用 LLM）。
   - 若 `action = check_when_condition_meet`：按 `watch_condition` 设置本地触发器，**条件触发时**再次调用 LLM 继续验证。
-  - 若 `action = buy_long | buy_short`：为节省 LLM call，“可执行交易计划”在**同一次**点位验证响应中一并产出。
+  - 若 `action = buy_long | buy_short`：为节省 LLM call，“期权交易计划”在**同一次**点位验证响应中一并产出，用于直接下 Alpaca paper trading 订单 （在Enable Alpaca Paper Trading Auth Trading时）。
 
 ### 2.3 第三层：交易生命周期编排 (Trade Orchestration)
 目前系统的 AI 只负责“入场点是否成立”。要让 LLM 真正“完成一笔交易”，需要把 AI 的职责扩展为：从**入场计划 → 持仓管理 → 出场计划 → 复盘结算**的闭环，并且用明确的状态机与结构化输出把它工程化。
 
 - **核心原则**:
-  1) **LLM 决策，系统模拟执行**：LLM 负责输出结构化的入场/出场计划与管理决策；触发、成交、PnL 计算由系统按“模拟成交模型”确定性完成（不做真实下单）。
-  2) **分钟级持仓管理（默认每分钟调用）**：持仓期间默认每根 1m bar 收盘后调用 LLM，让 LLM 判断对持仓应该做什么操作（继续持有/减仓/平仓/移动止损）。后续若遇到成本或延迟瓶颈，再演进为事件驱动降频。
+  1) **LLM 决策，系统 paper trading 执行（需开关开启）**：仅当 Settings 中启用 “Enable Alpaca Paper Trading Auto Trading” 时，系统才会根据 LLM 的交易计划自动提交 Alpaca paper trading 订单；否则只提示信号、不下单。开启后，系统使用 Alpaca paper trading API 真实下单，并以订单回报与成交记录作为结算与复盘事实来源。
+  2) **降频优先（以触发为主）**：持仓管理优先用止盈/止损/时间止损等触发器自动执行；需要额外判断时再调用 LLM。
   3) **一致性与可追溯**：每一笔交易都有 `trade_id`，每次 AI 决策都有 `analysis_id`，所有更新都附带“基于哪些事实做出改变”。
 
 - **交易状态机 (FSM)**:
   - `SCAN`：量化引擎持续扫描（当前实现：ZScoreMomentum / z_score_diff 阈值穿越生成 long/short 信号）。
   - `ENTRY_CANDIDATE`：量化信号出现，生成候选入场窗口（bar 时间戳 + 方向 long/short + 触发参考价位）。
-  - `AI_VERIFY`：调用 LLM 做“点位验证”，输出 `action`；若为 `buy_long/buy_short`，同一次响应中一并输出交易计划。
+  - `AI_VERIFY`：调用 LLM 做“点位验证”，输出 `action`；若为 `buy_long/buy_short`，同一次响应中一并输出期权交易计划（合约 + 止盈/止损/时间止损）。
   - `FOLLOW_UP_PENDING`：若 `action = follow_up`，等待下一根 1m K 线收盘后回到 `AI_VERIFY`（循环验证）。
   - `WATCH_PENDING`：若 `action = check_when_condition_meet`，等待 `watch_condition` 条件触发后回到 `AI_VERIFY`（循环验证）。
-  - `PLAN_READY`：仅当 `action = buy_long | buy_short`，且该次 AI_VERIFY 响应中已包含交易计划，进入可执行态（阶段一简化：只交易正股、买卖 1 股、一次性入场一次性出场）。
-  - `IN_POSITION`：入场价固定为触发 `buy_long/buy_short` 的那根 1m K 线收盘价（模拟成交），随后默认每根 1m bar 收盘后调用 LLM，输出 hold/close。
-  - `EXIT_PENDING`：当 LLM 决策为 close（或系统触发硬止损）时进入平仓流程，平仓价为做出 close 决策的该根 1m K 线收盘价（模拟成交）；为节省 LLM call，LLM 在输出 close 的同一次响应里必须同时给出结算 PnL、交易记录、复盘总结和规则建议；系统在平仓后一次性写入记录。
-  - `CLOSED`：平仓完成，交易记录与复盘内容均已落库。
+  - `PLAN_READY`：仅当 `action = buy_long | buy_short`，且该次 AI_VERIFY 响应中已包含期权交易计划，进入可执行态。
+  - `ENTRY_PENDING`：仅当启用 “Enable Alpaca Paper Trading Auto Trading” 时，系统才向 Alpaca paper trading 提交期权入场限价单，这里的限价单默认为 ask_price + 0.03，尽量保证立马成交；若从下单到**下一根 1m K 线收盘**仍未成交，则撤单并结束，放弃该入场点并继续寻找下一个入场点。未启用时不下单，停留在提示/观察态。
+  - `IN_POSITION`：入场单成交后进入持仓，自行挂止盈止损单；每根 1m K 线收盘时系统向 LLM 发起一次“卖出点位判断”请求，LLM 输出持仓管理动作（hold/全平/部分平仓/调整止盈止损/更新时间止损等）；若启用 “Enable Alpaca Paper Trading Auto Trading”，系统按该动作自动提交对应的 Alpaca paper trading 平仓/改单；同时系统持续监控止盈/止损/时间止损等硬规则，触发时进入 `EXIT_PENDING`。
+  - `EXIT_PENDING`：当所有合约已被平仓（例如 LLM 输出 close_all/close_partial 导致全部卖出 / 止盈触发 / 止损触发 / 时间止损触发），进入平仓结算流程；系统按触发条件使用不同的平仓订单类型（见下方执行模型），并基于 Alpaca 的成交回报自动计算 PnL、生成交易记录并落库。
+  - `CLOSED`：平仓完成，订单回报、成交与结算记录均已落库。
 
 - **LLM 在一笔交易里要做的事情**:
-  1) **点位验证 + 入场计划 (Verify + Plan)**：输出 `buy_long/buy_short/ignore/follow_up/check_when_condition_meet`；若为 `buy_long/buy_short`，在同一次响应中同时输出止损/止盈价位；系统以该根 1m bar 的收盘价入场（模拟成交）。
-  2) **持仓管理 (Position Management)**：持仓期间默认每根 1m bar 收盘调用，仅输出 hold/close。
-  3) **平仓即结算与复盘 (Close → Settle + Review)**：当输出 close 时，LLM 在同一次响应里同时给出结算 PnL、交易记录、复盘总结和规则建议；系统按 1m close 模拟成交并落库。
+  1) **点位验证 + 期权交易计划 (Verify + Option Plan)**：输出 `buy_long/buy_short/ignore/follow_up/check_when_condition_meet`；若为 `buy_long/buy_short`，在同一次响应中输出期权交易计划（合约 + 止盈/止损/时间止损），用于直接下 Alpaca paper trading 订单。
+  2) **持仓管理 (Position Management)**：入场单成交后，每根 1m K 线收盘调用一次 LLM，输出“是否是好的卖出点位”以及要采取的卖出/调整动作（例如 hold / close_all / close_partial / tighten_stop / update_time_stop / adjust_take_profit）。
 
 - **降频优化的事件触发器（可选，未来用于减少每分钟调用）**:
   - **价格触发**：接近止损/止盈阈值（例如距离 < 0.15R 或 < 0.2%）。
@@ -57,84 +57,303 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
   - **波动触发**：瞬时波动/点差扩大（提示流动性风险，可能提前锁利）。
 
 - **利润计算（系统侧，LLM 使用结果做叙述）**:
-  - **标的 PnL（用于回测/模拟）**：`pnl_underlying = (exit_price - entry_price) * qty`（做空相反）。
-  - **标准化指标**：`R_multiple = pnl_underlying / (abs(entry_price - stop_price) * qty)`，并记录最大回撤、持仓时长。
-  - **（阶段二）期权 PnL**：在正股闭环稳定后再引入期权估值与点差/滑点约束。
+  - **期权 PnL（以 Alpaca paper trading 成交回报为准）**：系统以 Alpaca paper trading 的成交回报（fills）为唯一真相来源，计算 `pnl_option_usd`；公式仅作为说明：`pnl_option_usd = (exit_premium - entry_premium) * contracts * 100`（做空相反；买 call/put 都适用）。
+  - **标准化指标**：同样基于成交回报计算的 `pnl_option_usd`：`R_multiple = pnl_option_usd / (abs(entry_premium - stop_premium) * contracts * 100)`，并记录最大回撤、持仓时长。
 
-- **模拟成交模型（Paper Fill Model）**:
-  - **入场成交**：当 LLM 在某根 1m bar 收盘后输出 `buy_long/buy_short`，系统直接以该根 bar 的 `close` 作为入场价（可选叠加固定滑点）。
-  - **出场成交**：当 LLM 输出 `close` 或触发止损/止盈时，系统以触发的该根 bar `close` 作为出场价（可选叠加固定滑点）。
-  - **时间粒度**：以 1m bar 为准（回放/实时一致）；后续可升级为更高频的报价/逐笔来提高模拟真实性。
+- **Alpaca Paper Trading 执行模型**:
+  - **入场成交**：系统提交期权限价单，默认限价为 `ask_price + 0.03` 以提高立刻成交的概率，成交价以 Alpaca paper trading 回报为准。
+  - **出场成交（按触发条件选择订单类型）**:
+    - **LLM 输出 close_all / close_partial**：系统使用 market order 立即卖出（平仓或部分平仓）。
+    - **止盈触发**：系统使用 limit order（以 `take_profit_premium` 为目标价）尝试卖出。
+    - **止损 / 时间止损触发**：系统使用 market stop order 立即执行风控平仓。
+  - **注意**：paper trading 是近似模拟，成交与滑点等假设与实盘可能不同。
 
 ### 2.4 LLM 结构化输出 Schema（面向“完整交易”）
 为了让 LLM 真正完成“点位验证→入场→出场→结算”的闭环，同时尽量减少 LLM call，需要把输出从单一的 `action` 扩展为“点位验证（buy 时同时包含交易计划）/持仓管理（close 时包含结算与复盘）”两类结构化消息。
 
 #### 2.4.1 点位验证 + 交易计划（同一次 call；buy_long/buy_short 时返回 trade_plan）
+**A) buy_long（同次返回 trade_plan）**
 ```jsonc
 {
-  "analysis_id": "...",
+  "analysis_id": "anl_01JXK0F8K0QWQJ7H3P4ZK8S3Q4",
   "timestamp": "2026-01-20T17:38:00Z",
-  "symbol": "TICKER",
+  "symbol": "NVDA",
   "action": "buy_long", // buy_long | buy_short | ignore | follow_up | check_when_condition_meet
-  "confidence": 0.85,
-  "reasoning": "...",
+  "confidence": 0.86,
+  "reasoning": "Breakout confirmed with reclaim + expansion; risk is defined; momentum favors continuation.",
   "pattern_name": "Bull Flag Breakout",
   "breakout_price": 347.5,
   "watch_condition": null,
   "trade_plan": {
-    "trade_id": "...",
-    "side": "long", // long | short
-    "instrument": { "type": "stock", "shares": 1 },
-    "entry_underlying": "bar_close",
-    "stop_loss_underlying": 346.4,
-    "take_profit_underlying": 349.6
+    "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+    "direction": "long", // long | short
+    "option": {
+      "right": "call", // call | put
+      "expiration": "2026-01-23",
+      "strike": 350
+    },
+    "contracts": 1,
+    "risk": {
+      "stop_loss_premium": 0.85,
+      "time_stop_minutes": 15
+    },
+    "take_profit_premium": 2.1
   }
 }
 ```
 
-#### 2.4.2 持仓管理决策（默认每根 1m bar 收盘调用；action=close 时同一次输出结算与复盘）
+**B) buy_short（同次返回 trade_plan）**
 ```jsonc
 {
-  "trade_id": "...",
-  "analysis_id": "...",
-  "timestamp": "2026-01-20T17:44:00Z",
-  "symbol": "TICKER",
-  "bar_time": "2026-01-20T17:44:00Z",
-  "position_state": "in_position", // in_position | exit_pending
-  "position": {
-    "side": "long",
-    "shares_total": 1,
-    "shares_remaining": 1,
-    "entry": { "time": "...", "underlying": 347.6 },
-    "mark": { "time": "...", "underlying": 348.2 },
-    "pnl": {
-      "pnl_underlying_usd": 54.0,
-      "max_drawdown_usd": 38.0,
-      "minutes_in_trade": 6
+  "analysis_id": "anl_01JXK0G2Q2F3W0K3H8N2F7M1Z9",
+  "timestamp": "2026-01-20T18:12:00Z",
+  "symbol": "TSLA",
+  "action": "buy_short",
+  "confidence": 0.78,
+  "reasoning": "Failed reclaim + rejection at VWAP; downside momentum building; risk/reward acceptable for a quick scalp.",
+  "pattern_name": "VWAP Rejection",
+  "breakout_price": 231.2,
+  "watch_condition": null,
+  "trade_plan": {
+    "trade_id": "trd_01JXK0G2V8W5X1R0K2P9C3D7E6",
+    "direction": "short",
+    "option": {
+      "right": "put",
+      "expiration": "2026-01-23",
+      "strike": 230
     },
+    "contracts": 1,
     "risk": {
-      "stop_underlying": 346.4
-    }
+      "stop_loss_premium": 0.9,
+      "time_stop_minutes": 12
+    },
+    "take_profit_premium": 2.0
+  }
+}
+```
+
+**C) ignore（不返回 trade_plan）**
+```jsonc
+{
+  "analysis_id": "anl_01JXK0H9S3C8P6N7W2Z1K5T4Y0",
+  "timestamp": "2026-01-20T18:25:00Z",
+  "symbol": "AAPL",
+  "action": "ignore",
+  "confidence": 0.62,
+  "reasoning": "Signal is too close to major resistance; volume is below average; breakout quality is low.",
+  "pattern_name": "Weak Breakout Attempt",
+  "breakout_price": 204.4,
+  "watch_condition": null,
+  "trade_plan": null
+}
+```
+
+**D) follow_up（下一根 1m 收盘再验证）**
+```jsonc
+{
+  "analysis_id": "anl_01JXK0J1B6Y5T2M9Q4R8V1A7C3",
+  "timestamp": "2026-01-20T18:31:00Z",
+  "symbol": "AMD",
+  "action": "follow_up",
+  "confidence": 0.7,
+  "reasoning": "Setup is close, but needs one more 1m close to confirm breakout hold; re-check next bar close.",
+  "pattern_name": "Breakout Hold Check",
+  "breakout_price": 176.8,
+  "watch_condition": null,
+  "trade_plan": null
+}
+```
+
+**E) check_when_condition_meet（挂 watch_condition，触发后再验证）**
+```jsonc
+{
+  "analysis_id": "anl_01JXK0K8D9H1Q0W3S6T5U4V2X1",
+  "timestamp": "2026-01-20T18:40:00Z",
+  "symbol": "META",
+  "action": "check_when_condition_meet",
+  "confidence": 0.73,
+  "reasoning": "Structure is constructive, but entry only makes sense if price breaks above the trigger with strength.",
+  "pattern_name": "Range Break",
+  "breakout_price": 349.8,
+  "watch_condition": {
+    "trigger_price": 349.8,
+    "direction": "above",
+    "expiry_minutes": 30
+  },
+  "trade_plan": null
+}
+```
+
+#### 2.4.2 持仓管理决策（默认按触发调用；action=close 时同一次输出结算与复盘）
+**A) hold（继续持有，不做任何改单/下单）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1A9M1C2B3N4V5X6Z7Q8W9",
+  "timestamp": "2026-01-20T17:44:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:44:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": null },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:44:00Z", "premium": 1.35 },
+    "pnl": { "pnl_option_usd": 26.0, "max_drawdown_usd": 18.0, "minutes_in_trade": 5 },
+    "risk": { "stop_loss_premium": 0.85, "take_profit_premium": 2.1, "time_stop_minutes": 15 }
   },
   "decision": {
-    "action": "close", // hold | close
-    "reasoning": "Momentum stalling at resistance; close on this 1m close.",
-    "close_outcome": {
-      "fills": {
-        "entry": { "time": "...", "underlying": 347.6, "shares": 1 },
-        "exit": { "time": "...", "underlying": 348.2, "shares": 1 }
-      },
-      "pnl": {
-        "pnl_underlying_usd": 0.6,
-        "max_drawdown_usd": 38.0,
-        "hold_minutes": 6
-      },
-      "review": {
-        "what_worked": ["Exit discipline"],
-        "what_to_improve": ["Avoid entering directly into nearby resistance"],
-        "rule_update_suggestion": "If entry is within 0.2% of resistance, require stronger volume or skip."
-      }
-    }
+    "action": "hold", // hold | close_all | close_partial | tighten_stop | adjust_take_profit | update_time_stop
+    "reasoning": "Trend/momentum still intact; no reversal signal on this 1m close.",
+    "exit": null,
+    "adjustments": null,
+    "close_outcome": null
+  }
+}
+```
+
+**B) tighten_stop（收紧止损，更新 stop_loss_premium）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1B4P0K9R8S7T6U5V4W3X2",
+  "timestamp": "2026-01-20T17:47:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:47:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": null },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:47:00Z", "premium": 1.52 },
+    "pnl": { "pnl_option_usd": 60.0, "max_drawdown_usd": 18.0, "minutes_in_trade": 8 },
+    "risk": { "stop_loss_premium": 0.85, "take_profit_premium": 2.1, "time_stop_minutes": 15 }
+  },
+  "decision": {
+    "action": "tighten_stop",
+    "reasoning": "Price advanced; reduce downside by tightening stop to protect gains.",
+    "exit": null,
+    "adjustments": { "new_stop_loss_premium": 1.05, "new_take_profit_premium": null, "new_time_stop_minutes": null },
+    "close_outcome": null
+  }
+}
+```
+
+**C) adjust_take_profit（调整止盈目标，更新 take_profit_premium）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1C2F9E8D7C6B5A4Z3Y2X1",
+  "timestamp": "2026-01-20T17:50:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:50:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": null },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:50:00Z", "premium": 1.88 },
+    "pnl": { "pnl_option_usd": 132.0, "max_drawdown_usd": 18.0, "minutes_in_trade": 11 },
+    "risk": { "stop_loss_premium": 1.05, "take_profit_premium": 2.1, "time_stop_minutes": 15 }
+  },
+  "decision": {
+    "action": "adjust_take_profit",
+    "reasoning": "Momentum strong; extend take-profit target to let winners run.",
+    "exit": null,
+    "adjustments": { "new_stop_loss_premium": null, "new_take_profit_premium": 2.4, "new_time_stop_minutes": null },
+    "close_outcome": null
+  }
+}
+```
+
+**D) update_time_stop（更新时间止损，延长/缩短 time_stop_minutes）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1D7N6M5L4K3J2H1G0F9E8",
+  "timestamp": "2026-01-20T17:52:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:52:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": null },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:52:00Z", "premium": 1.73 },
+    "pnl": { "pnl_option_usd": 102.0, "max_drawdown_usd": 18.0, "minutes_in_trade": 13 },
+    "risk": { "stop_loss_premium": 1.05, "take_profit_premium": 2.4, "time_stop_minutes": 15 }
+  },
+  "decision": {
+    "action": "update_time_stop",
+    "reasoning": "Trade is progressing but needs a bit more time; extend time stop.",
+    "exit": null,
+    "adjustments": { "new_stop_loss_premium": null, "new_take_profit_premium": null, "new_time_stop_minutes": 20 },
+    "close_outcome": null
+  }
+}
+```
+
+**E) close_partial（部分平仓；close_outcome 为空，结算以 Alpaca fills 为准）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1E3Q2W1E0R9T8Y7U6I5O4",
+  "timestamp": "2026-01-20T17:54:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:54:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": null },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:54:00Z", "premium": 1.95 },
+    "pnl": { "pnl_option_usd": 146.0, "max_drawdown_usd": 18.0, "minutes_in_trade": 15 },
+    "risk": { "stop_loss_premium": 1.05, "take_profit_premium": 2.4, "time_stop_minutes": 20 }
+  },
+  "decision": {
+    "action": "close_partial",
+    "reasoning": "Momentum stalling near resistance; take partial profits and reduce exposure.",
+    "exit": { "contracts_to_close": 1 },
+    "adjustments": { "new_stop_loss_premium": null, "new_take_profit_premium": null, "new_time_stop_minutes": null },
+    "close_outcome": null
+  }
+}
+```
+
+**F) close_all（全部平仓；结算由系统基于 Alpaca fills 在交易结束后统一计算）**
+```jsonc
+{
+  "trade_id": "trd_01JXK0F8M7R9Q7Z6N0H3Q8A2B1",
+  "analysis_id": "mgmt_01JXK1F9A8S7D6F5G4H3J2K1L0",
+  "timestamp": "2026-01-20T17:56:00Z",
+  "symbol": "NVDA",
+  "bar_time": "2026-01-20T17:56:00Z",
+  "position": {
+    "direction": "long",
+    "option": { "right": "call", "expiration": "2026-01-23", "strike": 350 },
+    "contracts_total": 2,
+    "contracts_remaining": 2,
+    "orders": { "entry_order_id": "ord_entry_...", "exit_order_id": "ord_exit_..." },
+    "entry": { "time": "2026-01-20T17:39:12Z", "premium": 1.22 },
+    "mark": { "time": "2026-01-20T17:56:00Z", "premium": 1.62 },
+    "pnl": { "pnl_option_usd": 80.0, "max_drawdown_usd": 22.0, "minutes_in_trade": 17 },
+    "risk": { "stop_loss_premium": 1.05, "take_profit_premium": 2.4, "time_stop_minutes": 20 }
+  },
+  "decision": {
+    "action": "close_all",
+    "reasoning": "Reversal signal + momentum breakdown; exit now to protect remaining gains.",
+    "exit": { "contracts_to_close": 2 },
+    "adjustments": null
   }
 }
 ```
@@ -300,6 +519,30 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
       - **对话流**: 玻璃面板容器。AI 的分析结果以对话气泡形式呈现，模拟打字机效果。
       - **内容**: 实时同步显示对左侧当前 K 线形态的分析、趋势预测及操作建议。
       - **动态反馈**: 当检测到关键信号时，窗口边缘闪烁特定颜色（如金色表示高确信度机会）。
+
+#### E. 设置页 (Settings)
+- **页面目的**: 提供全局设置入口（后续可扩展更多选项）；当前仅控制是否开启 Alpaca paper trading 自动下单模式。
+- **进入方式**:
+  - **全局入口**: Navigation Bar 右侧提供 Settings 图标按钮，任意页面可一键打开。
+  - **快捷返回**: 关闭 Settings 后回到打开前的页面与滚动位置。
+- **呈现方式**: 采用右侧弹出式 Settings Drawer（非跳转页面），避免中断用户正在看的行情/回放。
+- **布局结构**:
+  - **Drawer 容器**: 桌面端宽度 420px，移动端全屏；顶部固定栏包含标题“设置”和关闭按钮。
+  - **关闭交互**: 右上角关闭按钮、Esc 键、点击遮罩层均可关闭。
+  - **设置卡片 (Settings Card)**: 玻璃拟态面板（圆角 16px，内边距 20px，轻微发光描边）。
+    - **标题**: “交易设置”。
+    - **唯一设置项：Paper Trading 自动下单 (Switch)**:
+      - **标题文案**: “启用 Alpaca Paper Trading 自动下单”。
+      - **说明文案**: “开启后，系统会根据 LLM 的 buy_long/buy_short/close 建议自动提交 Alpaca paper trading 的股票与期权订单（非实盘）。”
+      - **默认值**: 关闭。
+      - **开关规格**: 高 28px、宽 48px；关闭态轨道 #2A2A2A、开启态轨道 #2DFFB3；thumb 20px，开启态轻微外发光。
+      - **状态提示**:
+        - 关闭：灰色文案 “当前：仅提示信号，不会下单”。
+        - 开启：绿色文案 “当前：自动下 Alpaca paper trading 订单”。
+      - **安全交互**:
+        - 从关闭切到开启时弹出确认弹窗（玻璃拟态），主按钮“确认开启”，次按钮“取消”。
+        - 弹窗文案明确提示“这将自动提交 paper trading 订单”。
+      - **可访问性**: 使用原生 switch 语义；支持键盘 Space/Enter 切换；清晰 focus ring（2px 霓虹蓝外描边）。
 
 ## 6. 技术实现细节 (Technical Details)
 
