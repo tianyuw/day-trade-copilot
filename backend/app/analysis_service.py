@@ -1,3 +1,6 @@
+import asyncio
+import hashlib
+import time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -9,6 +12,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from .plotting import generate_chart_image
 from .llm_client import LLMClient
+from .llm_prompts import get_llm_system_prompt
 from .schemas import LLMAnalysisRequest, LLMAnalysisResponse
 from .indicators import ZScoreMomentum, MACD
 import os
@@ -17,6 +21,16 @@ class AnalysisService:
     def __init__(self, alpaca_client: Any):
         self.alpaca = alpaca_client
         self.llm_client = LLMClient()
+        self._analysis_cache: dict[str, tuple[float, LLMAnalysisResponse]] = {}
+        self._analysis_inflight: dict[str, asyncio.Task[LLMAnalysisResponse]] = {}
+        self._cache_lock = asyncio.Lock()
+        self._cache_ttl_seconds = int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", "21600"))
+        self._prompt_hash = hashlib.sha256(get_llm_system_prompt().encode("utf-8")).hexdigest()
+        self._model_hint = (
+            os.getenv("GOOGLE_MODEL", "gemini-3-flash-preview")
+            if os.getenv("GOOGLE_API_KEY")
+            else os.getenv("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+        )
 
     async def _get_bars_df(
         self,
@@ -73,11 +87,62 @@ class AnalysisService:
         except Exception:
             return None
 
+    def _stable_analysis_id(self, symbol: str, current_time: str) -> str:
+        raw = f"{symbol}|{current_time}|{self._model_hint}|{self._prompt_hash}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     async def analyze_signal(
         self, 
         request: LLMAnalysisRequest, 
         preloaded_daily_bars: pd.DataFrame = None, 
         preloaded_intraday_bars: pd.DataFrame = None
+    ) -> LLMAnalysisResponse:
+        analysis_id = self._stable_analysis_id(request.symbol, request.current_time)
+        now = time.monotonic()
+
+        async with self._cache_lock:
+            cached = self._analysis_cache.get(analysis_id)
+            if cached and cached[0] > now:
+                return cached[1]
+
+            inflight = self._analysis_inflight.get(analysis_id)
+            if inflight is None:
+                inflight = asyncio.create_task(
+                    self._analyze_signal_uncached(
+                        request,
+                        preloaded_daily_bars=preloaded_daily_bars,
+                        preloaded_intraday_bars=preloaded_intraday_bars,
+                    )
+                )
+                self._analysis_inflight[analysis_id] = inflight
+
+        try:
+            response = await inflight
+        finally:
+            async with self._cache_lock:
+                if self._analysis_inflight.get(analysis_id) is inflight:
+                    self._analysis_inflight.pop(analysis_id, None)
+
+        response = response.model_copy(update={"analysis_id": analysis_id})
+        async with self._cache_lock:
+            self._analysis_cache[analysis_id] = (time.monotonic() + self._cache_ttl_seconds, response)
+        return response
+
+    async def get_cached_analysis(self, analysis_id: str) -> LLMAnalysisResponse | None:
+        now = time.monotonic()
+        async with self._cache_lock:
+            cached = self._analysis_cache.get(analysis_id)
+            if cached and cached[0] > now:
+                return cached[1]
+            if cached:
+                self._analysis_cache.pop(analysis_id, None)
+        return None
+
+    async def _analyze_signal_uncached(
+        self,
+        request: LLMAnalysisRequest,
+        preloaded_daily_bars: pd.DataFrame = None,
+        preloaded_intraday_bars: pd.DataFrame = None,
     ) -> LLMAnalysisResponse:
         # 1. Parse current time
         current_dt = datetime.fromisoformat(request.current_time.replace("Z", "+00:00"))
@@ -412,7 +477,5 @@ Recent Price Action (Last 60 mins):
             else:
                 context_text += "    - N/A\n"
 
-        # 5. Call LLM
         response = await self.llm_client.analyze_chart(request, chart_base64, context_text)
-        
         return response

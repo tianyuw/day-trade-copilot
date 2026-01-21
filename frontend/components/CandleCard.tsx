@@ -42,6 +42,20 @@ function formatPSTFromUtcSeconds(utcSeconds: number): string {
   return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
 }
 
+function toUtcSeconds(time: Time): number | null {
+  if (typeof time === "number" && Number.isFinite(time)) return time
+  if (typeof time === "string") {
+    const ms = new Date(time).getTime()
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null
+  }
+  if (typeof time === "object" && time && "year" in time && "month" in time && "day" in time) {
+    const t = time as { year: number; month: number; day: number }
+    const ms = Date.UTC(t.year, t.month - 1, t.day, 0, 0, 0, 0)
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null
+  }
+  return null
+}
+
 function barsToCandles(
   bars: Bar[],
 ): CandlestickData<Time>[] {
@@ -174,6 +188,111 @@ function computeVWAP(bars: Bar[]): LineData<Time>[] {
   return result
 }
 
+export function MiniCandleChart({
+  bars,
+  className,
+}: {
+  bars: Bar[]
+  className?: string
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const chartRef = useRef<IChartApi | null>(null)
+  const seriesRef = useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null)
+  const ema9SeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
+  const ema21SeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
+
+  const candles = useMemo(() => barsToCandles(bars), [bars])
+  const markers = useMemo(() => barsToMarkers(bars), [bars])
+  const ema9 = useMemo(() => computeEMA(bars, 9), [bars])
+  const ema21 = useMemo(() => computeEMA(bars, 21), [bars])
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    if (chartRef.current) return
+
+    const chart = createChart(containerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: "rgba(0,0,0,0)" },
+        textColor: "rgba(255,255,255,.7)",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+        attributionLogo: false,
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,.04)" },
+        horzLines: { color: "rgba(255,255,255,.04)" },
+      },
+      crosshair: { mode: CrosshairMode.Hidden },
+      rightPriceScale: { visible: false },
+      timeScale: { visible: false, borderVisible: false, barSpacing: 3 },
+      handleScroll: false,
+      handleScale: false,
+    })
+
+    const series = chart.addCandlestickSeries({
+      upColor: "rgba(34,211,238,1)",
+      downColor: "rgba(248,113,113,1)",
+      borderUpColor: "rgba(34,211,238,1)",
+      borderDownColor: "rgba(248,113,113,1)",
+      wickUpColor: "rgba(34,211,238,.9)",
+      wickDownColor: "rgba(248,113,113,.9)",
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+
+    const ema9Series = chart.addLineSeries({
+      color: "rgba(34,197,94,0.85)",
+      lineWidth: 1,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+
+    const ema21Series = chart.addLineSeries({
+      color: "rgba(248,113,113,0.85)",
+      lineWidth: 1,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+
+    chartRef.current = chart
+    seriesRef.current = series
+    ema9SeriesRef.current = ema9Series
+    ema21SeriesRef.current = ema21Series
+
+    const ro = new ResizeObserver(() => {
+      if (!containerRef.current || !chartRef.current) return
+      chartRef.current.applyOptions({
+        width: containerRef.current.clientWidth,
+        height: containerRef.current.clientHeight,
+      })
+      chartRef.current.timeScale().fitContent()
+    })
+    ro.observe(containerRef.current)
+
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!seriesRef.current) return
+    seriesRef.current.setData(candles)
+    seriesRef.current.setMarkers(markers)
+    chartRef.current?.timeScale().fitContent()
+  }, [candles, markers])
+
+  useEffect(() => {
+    if (!ema9SeriesRef.current || !ema21SeriesRef.current) return
+    ema9SeriesRef.current.setData(ema9)
+    ema21SeriesRef.current.setData(ema21)
+  }, [ema9, ema21])
+
+  return (
+    <div className={cn("h-24 w-full", className)}>
+      <div ref={containerRef} className="h-full w-full" />
+    </div>
+  )
+}
+
 export function CandleCard({
   symbol,
   bars,
@@ -208,6 +327,7 @@ export function CandleCard({
   const bbUpperSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbMiddleSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
   const bbLowerSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
+  const axisOptionsAppliedRef = useRef(false)
   
   const [lastAnalyzedTime, setLastAnalyzedTime] = useState<number | null>(null)
 
@@ -253,6 +373,36 @@ export function CandleCard({
   )
 
   useEffect(() => {
+    if (!chartRef.current) return
+    if (axisOptionsAppliedRef.current) return
+    chartRef.current.applyOptions({
+      timeScale: {
+        visible: true,
+        borderVisible: true,
+        ticksVisible: true,
+        borderColor: "rgba(255,255,255,.08)",
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => {
+          const utcSeconds = toUtcSeconds(time)
+          if (utcSeconds == null) return ""
+          return formatPSTFromUtcSeconds(utcSeconds)
+        },
+      },
+      localization: {
+        dateFormat: "yyyy-MM-dd",
+        timeFormatter: (time: Time) => {
+          const utcSeconds = toUtcSeconds(time)
+          if (utcSeconds == null) return ""
+          return formatPSTFromUtcSeconds(utcSeconds)
+        },
+      },
+    })
+    chartRef.current.timeScale().fitContent()
+    axisOptionsAppliedRef.current = true
+  }, [candles.length])
+
+  useEffect(() => {
     if (!containerRef.current) return
     if (chartRef.current) return
 
@@ -273,30 +423,35 @@ export function CandleCard({
           color: "rgba(34,211,238,0.5)",
           width: 1,
           style: 1, // LineStyle.Dotted
+          labelVisible: true,
           labelBackgroundColor: "#22d3ee",
         },
         horzLine: {
           color: "rgba(34,211,238,0.5)",
           width: 1,
           style: 1, // LineStyle.Dotted
+          labelVisible: true,
           labelBackgroundColor: "#22d3ee",
         },
       },
       timeScale: {
+        visible: true,
+        borderVisible: true,
+        ticksVisible: true,
         borderColor: "rgba(255,255,255,.08)",
         timeVisible: true,
         secondsVisible: false,
         tickMarkFormatter: (time: Time) => {
-          const utcSeconds = typeof time === "number" ? time : Number.NaN
-          if (!Number.isFinite(utcSeconds)) return null
+          const utcSeconds = toUtcSeconds(time)
+          if (utcSeconds == null) return ""
           return formatPSTFromUtcSeconds(utcSeconds)
         },
       },
       localization: {
         dateFormat: "yyyy-MM-dd",
         timeFormatter: (time: Time) => {
-          const utcSeconds = typeof time === "number" ? time : Number.NaN
-          if (!Number.isFinite(utcSeconds)) return ""
+          const utcSeconds = toUtcSeconds(time)
+          if (utcSeconds == null) return ""
           return formatPSTFromUtcSeconds(utcSeconds)
         },
       },
@@ -547,6 +702,19 @@ export function CandleCard({
     ? ((currentPrice - prevClose) / prevClose * 100) 
     : null
 
+  const xAxisLabels = useMemo(() => {
+    if (!candles.length) return null
+    const first = toUtcSeconds(candles[0].time)
+    const last = toUtcSeconds(candles[candles.length - 1].time)
+    const mid = toUtcSeconds(candles[Math.floor(candles.length / 2)].time)
+    const focus = overlayData?.time != null ? toUtcSeconds(overlayData.time as any) : null
+    return {
+      left: first != null ? formatPSTFromUtcSeconds(first) : "",
+      mid: (focus ?? mid) != null ? formatPSTFromUtcSeconds((focus ?? mid) as number) : "",
+      right: last != null ? formatPSTFromUtcSeconds(last) : "",
+    }
+  }, [candles, overlayData?.time])
+
 
   const badge = status === "hot" ? "🔥 AI" : status === "watch" ? "⚡ Quant" : ""
 
@@ -640,6 +808,13 @@ export function CandleCard({
       <div className="relative mt-3 h-full w-full flex-1 min-h-[400px]">
         <div ref={containerRef} className="h-full w-full" />
       </div>
+      {xAxisLabels && (
+        <div className="mt-2 flex items-center justify-between text-xs font-mono text-white/40">
+          <div>{xAxisLabels.left}</div>
+          <div className="text-white/55">{xAxisLabels.mid}</div>
+          <div>{xAxisLabels.right}</div>
+        </div>
+      )}
     </div>
   )
 }

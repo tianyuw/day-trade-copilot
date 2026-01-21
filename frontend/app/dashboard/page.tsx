@@ -1,5 +1,6 @@
 "use client"
 
+import { useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { CandleCard } from "../../components/CandleCard"
 import { AICopilot, type ChatMessage } from "../../components/AICopilot"
@@ -54,6 +55,7 @@ function AICopilotPanel({ symbol, messages }: { symbol: string; messages: ChatMe
 }
 
 export default function DashboardPage() {
+  const search = useSearchParams()
   const [selectedSymbol, setSelectedSymbol] = useState("NVDA")
   const [startLocal, setStartLocal] = useState("2026-01-09T06:31")
   const [isPlaying, setIsPlaying] = useState(false)
@@ -71,6 +73,20 @@ export default function DashboardPage() {
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
   const playbackCursorRef = useRef(0)
+
+  const symbolOptions = useMemo(() => {
+    const s = String(selectedSymbol || "").trim().toUpperCase()
+    if (!s) return DEFAULT_SYMBOLS
+    if (DEFAULT_SYMBOLS.includes(s)) return DEFAULT_SYMBOLS
+    return [s, ...DEFAULT_SYMBOLS]
+  }, [selectedSymbol])
+
+  useEffect(() => {
+    const q = String(search.get("symbol") || "").trim().toUpperCase()
+    if (!q) return
+    if (q === selectedSymbol) return
+    setSelectedSymbol(q)
+  }, [search, selectedSymbol])
 
   // Reset AI messages on symbol change or reset
   useEffect(() => {
@@ -129,7 +145,7 @@ export default function DashboardPage() {
       try {
         const base =
           process.env.NEXT_PUBLIC_BACKEND_API ??
-          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8001"}`
+          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
         const res = await fetch(`${base}/api/stocks/prev_close?symbols=${selectedSymbol}&asof=${startRFC}`)
         if (!res.ok) throw new Error("Failed to fetch prev close")
         const data = await res.json()
@@ -267,7 +283,7 @@ export default function DashboardPage() {
                   onChange={(e) => handleSymbolChange(e.target.value)}
                   className="appearance-none rounded-xl bg-white/10 pl-4 pr-10 py-2.5 text-sm font-bold text-white hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 transition-colors cursor-pointer"
                 >
-                  {DEFAULT_SYMBOLS.map(s => <option key={s} value={s} className="bg-slate-900">{s}</option>)}
+                  {symbolOptions.map(s => <option key={s} value={s} className="bg-slate-900">{s}</option>)}
                 </select>
                 <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-white/50">
                   <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

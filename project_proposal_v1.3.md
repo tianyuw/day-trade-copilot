@@ -18,46 +18,125 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 - **输入数据**:
   1. **市场数据**: 过去 30 分钟的 OHLCV 序列。
   2. **技术指标**: 过去 30 分钟的 EMA9, EMA21, Volume, VWAP, Bollinger Bands 序列。
-  3. **期权链数据 (Option Chain)**: 当前时刻所有相关期权合约的完整数据快照（包括 Strike Price, Expiration Date, Bid/Ask, Volume, Open Interest, Delta, Gamma, Theta, Vega）。这将使 LLM 能够基于真实的流动性和定价来选择最佳合约。
-  4. **视觉数据**: 生成的当日盘中完整的 K 线图图片，叠加指标、压力位（Resistance）和支撑位（Support）及量化算法标记出的突破点位。
-- **验证任务**: 确认该点位是否是合适的0DTE买点，买入的确信度有多大。同时给出具体的理由。也给出具体的操作计划，计划应该包括: 买call还是put，行权价，期权止损价格，止盈价格。
+  3. **视觉数据**: 生成的当日盘中完整的 K 线图图片，叠加指标、压力位（Resistance）和支撑位（Support）及量化算法标记出的突破点位。
+  4. **（阶段二）期权链数据 (Option Chain)**: 暂不启用；先用正股把入场/出场与 PnL 闭环打通后，再引入期权链用于合约选择与滑点/流动性约束。
+- **验证任务**:
+  - 产出结构化 `action`：`buy_long / buy_short / ignore / follow_up / check_when_condition_meet`。
+  - 若 `action = follow_up`：按 LLM 指示在**下一根 1m K 线收盘**继续验证（再次调用 LLM）。
+  - 若 `action = check_when_condition_meet`：按 `watch_condition` 设置本地触发器，**条件触发时**再次调用 LLM 继续验证。
+  - 若 `action = buy_long | buy_short`：为节省 LLM call，“可执行交易计划”在**同一次**点位验证响应中一并产出。
 
-### 2.3 结构化预测输出与风控
-LLM 必须返回严格的 **JSON 格式** 数据。
-**示例 JSON Payload**:
-```json
-### 4. LLM 结构化输出 Schema (JSON)
+### 2.3 第三层：交易生命周期编排 (Trade Orchestration)
+目前系统的 AI 只负责“入场点是否成立”。要让 LLM 真正“完成一笔交易”，需要把 AI 的职责扩展为：从**入场计划 → 持仓管理 → 出场计划 → 复盘结算**的闭环，并且用明确的状态机与结构化输出把它工程化。
 
-为了支持复杂的交易决策逻辑，LLM 的输出将严格遵循以下 JSON Schema。这确保了系统能准确解析 LLM 的意图（买入、观望、追单或条件单）。
+- **核心原则**:
+  1) **LLM 决策，系统模拟执行**：LLM 负责输出结构化的入场/出场计划与管理决策；触发、成交、PnL 计算由系统按“模拟成交模型”确定性完成（不做真实下单）。
+  2) **分钟级持仓管理（默认每分钟调用）**：持仓期间默认每根 1m bar 收盘后调用 LLM，让 LLM 判断对持仓应该做什么操作（继续持有/减仓/平仓/移动止损）。后续若遇到成本或延迟瓶颈，再演进为事件驱动降频。
+  3) **一致性与可追溯**：每一笔交易都有 `trade_id`，每次 AI 决策都有 `analysis_id`，所有更新都附带“基于哪些事实做出改变”。
 
-```json
+- **交易状态机 (FSM)**:
+  - `SCAN`：量化引擎持续扫描（当前实现：ZScoreMomentum / z_score_diff 阈值穿越生成 long/short 信号）。
+  - `ENTRY_CANDIDATE`：量化信号出现，生成候选入场窗口（bar 时间戳 + 方向 long/short + 触发参考价位）。
+  - `AI_VERIFY`：调用 LLM 做“点位验证”，输出 `action`；若为 `buy_long/buy_short`，同一次响应中一并输出交易计划。
+  - `FOLLOW_UP_PENDING`：若 `action = follow_up`，等待下一根 1m K 线收盘后回到 `AI_VERIFY`（循环验证）。
+  - `WATCH_PENDING`：若 `action = check_when_condition_meet`，等待 `watch_condition` 条件触发后回到 `AI_VERIFY`（循环验证）。
+  - `PLAN_READY`：仅当 `action = buy_long | buy_short`，且该次 AI_VERIFY 响应中已包含交易计划，进入可执行态（阶段一简化：只交易正股、买卖 1 股、一次性入场一次性出场）。
+  - `IN_POSITION`：入场价固定为触发 `buy_long/buy_short` 的那根 1m K 线收盘价（模拟成交），随后默认每根 1m bar 收盘后调用 LLM，输出 hold/close。
+  - `EXIT_PENDING`：当 LLM 决策为 close（或系统触发硬止损）时进入平仓流程，平仓价为做出 close 决策的该根 1m K 线收盘价（模拟成交）；为节省 LLM call，LLM 在输出 close 的同一次响应里必须同时给出结算 PnL、交易记录、复盘总结和规则建议；系统在平仓后一次性写入记录。
+  - `CLOSED`：平仓完成，交易记录与复盘内容均已落库。
+
+- **LLM 在一笔交易里要做的事情**:
+  1) **点位验证 + 入场计划 (Verify + Plan)**：输出 `buy_long/buy_short/ignore/follow_up/check_when_condition_meet`；若为 `buy_long/buy_short`，在同一次响应中同时输出止损/止盈价位；系统以该根 1m bar 的收盘价入场（模拟成交）。
+  2) **持仓管理 (Position Management)**：持仓期间默认每根 1m bar 收盘调用，仅输出 hold/close。
+  3) **平仓即结算与复盘 (Close → Settle + Review)**：当输出 close 时，LLM 在同一次响应里同时给出结算 PnL、交易记录、复盘总结和规则建议；系统按 1m close 模拟成交并落库。
+
+- **降频优化的事件触发器（可选，未来用于减少每分钟调用）**:
+  - **价格触发**：接近止损/止盈阈值（例如距离 < 0.15R 或 < 0.2%）。
+  - **结构触发**：跌破/突破 VWAP、EMA 失守、MACD 反向翻转、量能衰竭等。
+  - **时间触发**：0DTE 接近特定时刻（例如 10:00/11:00/13:30 PST）或持仓超过 `max_hold_minutes`。
+  - **波动触发**：瞬时波动/点差扩大（提示流动性风险，可能提前锁利）。
+
+- **利润计算（系统侧，LLM 使用结果做叙述）**:
+  - **标的 PnL（用于回测/模拟）**：`pnl_underlying = (exit_price - entry_price) * qty`（做空相反）。
+  - **标准化指标**：`R_multiple = pnl_underlying / (abs(entry_price - stop_price) * qty)`，并记录最大回撤、持仓时长。
+  - **（阶段二）期权 PnL**：在正股闭环稳定后再引入期权估值与点差/滑点约束。
+
+- **模拟成交模型（Paper Fill Model）**:
+  - **入场成交**：当 LLM 在某根 1m bar 收盘后输出 `buy_long/buy_short`，系统直接以该根 bar 的 `close` 作为入场价（可选叠加固定滑点）。
+  - **出场成交**：当 LLM 输出 `close` 或触发止损/止盈时，系统以触发的该根 bar `close` 作为出场价（可选叠加固定滑点）。
+  - **时间粒度**：以 1m bar 为准（回放/实时一致）；后续可升级为更高频的报价/逐笔来提高模拟真实性。
+
+### 2.4 LLM 结构化输出 Schema（面向“完整交易”）
+为了让 LLM 真正完成“点位验证→入场→出场→结算”的闭环，同时尽量减少 LLM call，需要把输出从单一的 `action` 扩展为“点位验证（buy 时同时包含交易计划）/持仓管理（close 时包含结算与复盘）”两类结构化消息。
+
+#### 2.4.1 点位验证 + 交易计划（同一次 call；buy_long/buy_short 时返回 trade_plan）
+```jsonc
 {
-  "timestamp": "2024-01-01T12:00:00Z",
+  "analysis_id": "...",
+  "timestamp": "2026-01-20T17:38:00Z",
   "symbol": "TICKER",
-  
-  // 核心决策动作
-  // 1. buy_long: 确认突破有效，做多 (Call)
-  // 2. buy_short: 确认跌破有效，做空 (Put)
-  // 3. ignore: 噪音波动，忽略
-  // 4. follow_up: 观察中，下一分钟再看 (例如：正在形成十字星，需要下一根确认)
-  // 5. check_when_condition_meet: 挂单模式 (例如：现在价格 100，如果突破 101 再叫我)
-  "action": "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet",
-  
-  // 置信度 (0.0 - 1.0)
+  "action": "buy_long", // buy_long | buy_short | ignore | follow_up | check_when_condition_meet
   "confidence": 0.85,
-  
-  // 决策理由 (简明扼要，支持 Markdown)
-  "reasoning": "Z-Score breakout confirmed with increasing volume. MACD histogram expanding. No immediate resistance overhead.",
-  
-  // [Scenario B] 仅在 action 为 "check_when_condition_meet" 时有效
-  // 意图：告诉系统设置一个本地触发器，一旦价格触及此位，立即再次唤醒 LLM
-  "watch_condition": {
-    "trigger_price": 347.50,
-    "direction": "above" | "below", // "above": 突破时触发, "below": 跌破时触发
-    "expiry_minutes": 30 // 这个条件的有效期，超过30分钟未触发则失效
+  "reasoning": "...",
+  "pattern_name": "Bull Flag Breakout",
+  "breakout_price": 347.5,
+  "watch_condition": null,
+  "trade_plan": {
+    "trade_id": "...",
+    "side": "long", // long | short
+    "instrument": { "type": "stock", "shares": 1 },
+    "entry_underlying": "bar_close",
+    "stop_loss_underlying": 346.4,
+    "take_profit_underlying": 349.6
   }
 }
 ```
+
+#### 2.4.2 持仓管理决策（默认每根 1m bar 收盘调用；action=close 时同一次输出结算与复盘）
+```jsonc
+{
+  "trade_id": "...",
+  "analysis_id": "...",
+  "timestamp": "2026-01-20T17:44:00Z",
+  "symbol": "TICKER",
+  "bar_time": "2026-01-20T17:44:00Z",
+  "position_state": "in_position", // in_position | exit_pending
+  "position": {
+    "side": "long",
+    "shares_total": 1,
+    "shares_remaining": 1,
+    "entry": { "time": "...", "underlying": 347.6 },
+    "mark": { "time": "...", "underlying": 348.2 },
+    "pnl": {
+      "pnl_underlying_usd": 54.0,
+      "max_drawdown_usd": 38.0,
+      "minutes_in_trade": 6
+    },
+    "risk": {
+      "stop_underlying": 346.4
+    }
+  },
+  "decision": {
+    "action": "close", // hold | close
+    "reasoning": "Momentum stalling at resistance; close on this 1m close.",
+    "close_outcome": {
+      "fills": {
+        "entry": { "time": "...", "underlying": 347.6, "shares": 1 },
+        "exit": { "time": "...", "underlying": 348.2, "shares": 1 }
+      },
+      "pnl": {
+        "pnl_underlying_usd": 0.6,
+        "max_drawdown_usd": 38.0,
+        "hold_minutes": 6
+      },
+      "review": {
+        "what_worked": ["Exit discipline"],
+        "what_to_improve": ["Avoid entering directly into nearby resistance"],
+        "rule_update_suggestion": "If entry is within 0.2% of resistance, require stronger volume or skip."
+      }
+    }
+  }
+}
 ```
 
 ## 3. 数据基础设施
@@ -100,7 +179,106 @@ LLM 必须返回严格的 **JSON 格式** 数据。
     - 醒目的 "Enter Replay Console" 按钮。
     - 悬停时产生霓虹光晕扩散效果，点击即刻跳转至回放控制台。
 
-#### B. K线回放控制台 (Replay Console)
+#### B. 股票实时追踪页面 (Stock Real-time Tracking Page)
+- **页面目的**: 实时监视最多10个股票ticker走势，自动高亮（Highlight）出现合适入场点的ticker，并将其动态排序至列表顶部，方便用户快速捕捉机会。
+- **页面布局与组件细节**:
+  - **1. 顶部控制区 (Control Header)**:
+    - **位置**: 页面顶部固定区域，采用玻璃拟态背景。
+    - **组件**:
+      - **Add Ticker Card**: 监控 Grid 的最后一个卡片为虚线边框 + 加号按钮。点击后弹出搜索（Search/Typeahead），用户输入或选择 Ticker 即可添加到监控列表（最多 10 个）。
+      - **Remove Ticker (Long-Press)**: 长按任意 Ticker 卡片进入“编辑态”，卡片右上角浮现删除按钮；点击即可移除该 Ticker 并退出编辑态。
+      - **Market Status Pill**: 顶部右侧显示当前股市状态（Pre-Market / Regular / After-Hours / Closed），并带有状态色与简短文案。
+      - **Next Session Countdown**: 在状态旁显示倒计时（例如“距开盘 00:17:32”或“距收盘 01:05:10”）。
+      - **System Pulse**: 右上角显示 "AI Monitoring" 呼吸灯指示器 (Neon Green)，表示 WebSocket 连接正常。
+  - **2. 监控主列表 (Live Monitor Grid)**:
+    - **布局**: 响应式网格布局 (Grid)，桌面端 2-3 列，移动端单列。
+    - **核心组件: `StockSignalCard` (智能信号卡片)**:
+      - **视觉风格**: 深色磨砂玻璃面板 (Frosted Glass)。默认状态低调，触发信号时激活 **"Focus Mode"**。
+      - **信息排布**:
+        - **Header (左上)**: Ticker Symbol (大号无衬线字体) + 现价 (实时跳动，涨绿跌红)。
+        - **Chart Area (中间)**: 嵌入 **Mini-CandleChart** (最近 30 分钟 K 线缩略图)，叠加 EMA 趋势线，直观展示短期形态。
+        - **Signal Badge (右上)**: 动态 AI 状态徽章。
+          - *Scanning*: 灰色脉冲动画，文字 "Scanning..."
+          - *Signal Detected*: 
+            - **LONG**: 绿色霓虹背景 + "BUY LONG" + 确信度 (e.g., "Confidence: 85%")
+            - **SHORT**: 红色霓虹背景 + "BUY SHORT" + 确信度
+        - **Pattern Info (底部)**: 显示 AI 识别到的形态名称 (e.g., "Bull Flag Breakout")。
+      - **交互**: 卡片整体可点击，点击后通过 **Shared Element Transition** 动画无缝展开至 Detail Page（Detail Page 会根据盘前/盘中/盘后/休市显示不同模式）。
+- **动态交互逻辑**:
+  - **自动置顶 (Auto-Sort)**: 当 AI 算法检测到信号 (Action == 'buy_long' || Action == 'buy_short') 时，该卡片自动以平滑动画 (Layout Animation) 移动到 Grid 的第一个位置。
+  - **视觉高亮 (Visual Urgency)**:
+    - **信号触发**: 当 AI 检测到 'buy_long' 或 'buy_short' 信号时，卡片边缘出现流动的霓虹光效 (Border Flow)，背景微弱闪烁，模拟"警报"紧迫感。
+  - **分析结果复用 (Analysis Reuse)**:
+    - **缓存目标**: 当某个 ticker 当天触发过 LLM 分析后，用户从 Tracking Page 点进 Detail Page 时，右侧 AI Copilot 立刻显示该 ticker 的“当日最新分析”，无需等待下一次实时触发。
+    - **缓存策略**:
+      - 后端为每个 `(symbol, trading_date)` 维护 `latest_analysis_id`（指向当天最新一条 LLM 输出），并对 `analysis_id -> LLMResponse` 做 TTL 缓存。
+      - 前端同时将 `analysis_id` 与响应体写入 localStorage（作为短期离线缓存/加速），并在 Detail Page 首屏优先读取展示。
+    - **路由承载**: Tracking Page 进入 Detail Page 时，在 URL 上附带 `analysis_id`（如 `/tracking/META?analysis_id=...`），Detail Page 用该 id 直接拉取/展示缓存分析。
+- **市场状态与关市处理 (Market Session Handling)**:
+  - **状态定义**:
+    - **Pre-Market (盘前)**: 开盘前的延长交易时段。
+    - **Regular (盘中)**: 正常交易时段。
+    - **After-Hours (盘后)**: 收盘后的延长交易时段。
+    - **Closed (休市)**: 周末/节假日/当日收盘后至次日盘前的非交易时段。
+  - **用户如何被告知当前状态**:
+    - **顶部 Market Status Pill**: 始终可见，作为“你现在看到的数据属于哪个时段”的单一真相来源。
+    - **状态切换 Toast**: 从盘前→盘中→盘后→休市时弹出短 Toast（例如“已开盘：切换到盘中模式”）。
+    - **颜色与语义一致**: Regular 用高亮绿、Pre/After 用蓝紫过渡、Closed 用低饱和灰，降低误判。
+  - **不同状态下的页面显示差异**:
+    - **Regular (盘中)**:
+      - **默认模式**: 全速实时刷新 + AI 信号高亮 + 自动置顶。
+      - **Mini-CandleChart**: 使用 1m bars，并在图表右上角显示“LIVE”标记。
+    - **Pre-Market / After-Hours (盘前/盘后)**:
+      - **视觉提醒**: 顶部加一行细 Banner（“延长交易时段：流动性更薄，滑点风险更高”）。
+      - **卡片信息**: 在价格旁增加小标签“PRE/POST”，并展示该时段的涨跌幅（与盘中涨跌幅区分）。
+      - **信号策略**: 仍可高亮 buy_long/buy_short，但在 Signal Badge 上附加“EXT”标识，提示信号发生在延长时段。
+    - **Closed (休市)**:
+      - **主视觉降噪**: 关闭霓虹警报特效与自动置顶，避免“假实时感”；卡片进入“静默模式”。
+      - **卡片信息**: 显示 Last Close、当日/前一交易日关键价位摘要（如 Prev High/Low、Close），Mini-CandleChart 切换到“最后交易日盘中缩略图”。
+      - **用户引导**: 顶部显示“市场休市”+“距离下一次开盘”倒计时，并提供一键切换到 Replay Console 进行复盘。
+  - **通知策略 (Notifications)**:
+    - **盘中信号**: 当 buy_long/buy_short 触发时，除卡片高亮外，可触发浏览器通知/声音提示（用户可在设置中关闭）。
+    - **休市信号处理**: 休市期间不推送“买入/卖出”类提示；只推送“开盘提醒/自选股异动回顾”类低频通知。
+- **技术实现**:
+  - **数据流**: 前端维护一个 `tickers` 数组，通过 WebSocket 订阅这 10 个 symbol 的实时 bar 数据。
+  - **动画库**: 使用 `Framer Motion` 实现卡片排序的平滑重排 (Reordering) 和进入/退出动画。
+  - **组件复用**: `StockSignalCard` 内部复用 `CandleCard` 的绘图逻辑，但简化坐标轴和工具栏，专注于形态展示。
+
+#### C. 股票详情页 (Ticker Detail Page)
+- **页面目的**: 聚焦单一 Ticker 的更大 K 线视图与 AI 解读，作为从 Tracking Page 的“发现信号”到“确认与决策”的承接页。
+- **布局结构**:
+  - **顶部信息条**:
+    - **Back**: 返回 Tracking Page。
+    - **Symbol + Price**: 股票代码与最新价格（或 last close）。
+    - **Market Status Pill + Countdown**: 显示当前 session 与距下一次开/收盘倒计时。
+  - **主区域**:
+    - **左侧：大图表 (CandleCard)**: 显示更完整的 1m bars，叠加 EMA/关键点位。
+    - **右侧：AI Copilot**: 展示 LLM 解释与操作建议，并在进入页面时自动加载“当日最新分析”（复用 tracking 的 analysis_id 或后端 `latest_analysis_id`，避免重复推理）。
+- **进入 Detail Page 时的分析加载逻辑**:
+  - **优先级**:
+    1) URL query 中的 `analysis_id`（来自 Tracking Page 点击进入，确保“所见即所得”）
+    2) 本地 localStorage 缓存的 `analysis_id -> analysis`（秒开体验）
+    3) 后端接口 `/api/analysis/latest?symbol=...&date=...` 返回 `latest_analysis_id`（兜底，确保跨设备/刷新也能取到当日最新）
+  - **显示行为**:
+    - 若存在缓存分析：进入页立即渲染成一条 AI 消息气泡（时间戳为分析生成时间），并在后续实时流触发新分析时追加更新。
+- **不同市场状态下的 Detail Page 显示差异**:
+  - **Regular (盘中)**:
+    - **模式**: 全实时模式（WS 持续更新 bars + AI 可在信号触发时自动推送）。
+    - **图表标识**: 图表角落显示 “LIVE”；价格与涨跌幅按盘中实时刷新。
+    - **AI 提示语**: 以“实时监控 + 触发即解释”为主，强调执行风险与止损位。
+  - **Pre-Market / After-Hours (盘前/盘后)**:
+    - **视觉提醒**: 顶部显示细 Banner（“延长交易时段：流动性更薄，滑点风险更高”）。
+    - **图表标识**: 显示 “PRE/POST” 标签；涨跌幅口径标注为“延长时段变动”，避免与盘中混淆。
+    - **AI 行为**: 允许继续推送，但在输出中附加 “EXT” 语义提示，强调信号可靠性与成交不确定性。
+  - **Closed (休市)**:
+    - **静态模式**: Detail Page 进入“只读/静默模式”，图表与 AI 对话框不做任何实时更新（不建立 WS 连接，不触发自动分析）。
+    - **页面内容**:
+      - **Market Closed 卡片**: 显示“市场休市”、下一次开盘时间/倒计时。
+      - **Last Session Summary**: 展示上一交易日的 O/H/L/C、涨跌幅、关键事件（如 gap、单日振幅）。
+      - **Replay CTA**: 提供一键跳转 Replay Console（建议默认带上当前 symbol）。
+    - **用户预期管理**: 在图表区域显示“休市：图表已冻结在最后交易时段”说明，避免用户误以为系统故障。
+
+#### D. K线回放控制台 (Replay Console)
 - **功能**: 沉浸式历史行情复盘与 AI 交互。
 - **布局结构**:
   - **1. 顶部控制栏 (Top Command Bar)**:
@@ -139,4 +317,3 @@ LLM 必须返回严格的 **JSON 格式** 数据。
 - **Database**:
   - **Time-series**: In-memory (Pandas DataFrame) for realtime window; Optional: TimescaleDB / InfluxDB for persistence.
   - **Cache**: Redis (Strategy Cache, Quant Signals).
-

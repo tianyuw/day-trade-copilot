@@ -81,7 +81,7 @@ class AlpacaClient:
             bars = bars_by_symbol[sym]
             bars.sort(key=lambda b: b.t)
             if len(bars) > limit:
-                bars_by_symbol[sym] = bars[:limit]
+                bars_by_symbol[sym] = bars[-limit:]
 
         return bars_by_symbol
 
@@ -93,43 +93,75 @@ class AlpacaClient:
             r.raise_for_status()
             return r.json()
 
+    async def get_clock(self) -> dict:
+        url = f"{self._settings.alpaca_trading_base_url}/v2/clock"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=self._headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_assets(self, status: str = "active", asset_class: str = "us_equity") -> list[dict]:
+        params = {"status": status, "asset_class": asset_class}
+        url = f"{self._settings.alpaca_trading_base_url}/v2/assets"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=self._headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            return []
+
     async def stream_minute_bars(self, symbols: Iterable[str]) -> AsyncIterator[tuple[str, AlpacaBar]]:
         symbols_list = [s.strip().upper() for s in symbols if s.strip()]
         if not symbols_list:
             return
 
-        async with websockets.connect(self._settings.alpaca_stream_url, ping_interval=20, ping_timeout=20) as ws:
-            await ws.send(json.dumps({"action": "auth", "key": self._settings.alpaca_api_key, "secret": self._settings.alpaca_secret_key}))
-            await ws.send(json.dumps({"action": "subscribe", "bars": symbols_list}))
-
-            while True:
-                raw = await ws.recv()
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-
-                if isinstance(msg, dict) and msg.get("T") == "error":
-                    raise RuntimeError(f"Alpaca stream error: {msg}")
-
-                if not isinstance(msg, list):
-                    continue
-
-                for item in msg:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("T") != "b":
-                        continue
-                    sym = str(item.get("S", "")).upper()
-                    yield sym, AlpacaBar(
-                        t=item["t"],
-                        o=float(item["o"]),
-                        h=float(item["h"]),
-                        l=float(item["l"]),
-                        c=float(item["c"]),
-                        v=float(item.get("v", 0)),
-                        n=None,
-                        vw=None,
+        backoff = 1.0
+        while True:
+            try:
+                async with websockets.connect(self._settings.alpaca_stream_url, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(
+                        json.dumps({"action": "auth", "key": self._settings.alpaca_api_key, "secret": self._settings.alpaca_secret_key})
                     )
+                    await ws.send(json.dumps({"action": "subscribe", "bars": symbols_list}))
+                    backoff = 1.0
 
-                await asyncio.sleep(0)
+                    while True:
+                        raw = await ws.recv()
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        if isinstance(msg, dict) and msg.get("T") == "error":
+                            raise RuntimeError(f"Alpaca stream error: {msg}")
+
+                        if not isinstance(msg, list):
+                            continue
+
+                        for item in msg:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("T") != "b":
+                                continue
+                            sym = str(item.get("S", "")).upper()
+                            yield sym, AlpacaBar(
+                                t=item["t"],
+                                o=float(item["o"]),
+                                h=float(item["h"]),
+                                l=float(item["l"]),
+                                c=float(item["c"]),
+                                v=float(item.get("v", 0)),
+                                n=None,
+                                vw=None,
+                            )
+
+                        await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise
+            except websockets.exceptions.ConnectionClosed:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+            except Exception:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
