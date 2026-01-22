@@ -1,29 +1,53 @@
 # 项目提案：Day Trade Copilot (v1.3)
 
 ## 1. 项目概览
-Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1 分钟 K 线图来辅助交易者。系统采用**“量化筛选 + AI 验证”**的双层架构：首先利用高效的多种量化指标算法实时扫描潜在的突破点位，一旦检测到信号，立即调用 **Gemini 3 Pro** 的多模态能力进行深度验证，确认突破的真实性和有效性，从而提供高胜率的可执行交易信号。
+Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1 分钟 K 线图来辅助交易者。系统采用**“量化筛选 + AI 验证”**的双层架构：首先利用高效的多种量化指标算法实时扫描潜在的突破点位，一旦检测到信号，立即调用 **gemini-3-flash-preview** 的多模态能力进行深度验证，确认突破的真实性和有效性，从而提供高胜率的可执行交易信号。
 
-*v1.3 版本核心变更：引入了 Pine Script 量化算法作为一级过滤器，将 AI 的角色从“每分钟巡检”转变为“按需验证”，显著降低成本并提高信号质量。*
+*v1.3 版本核心变更：引入了基于 Pine Script 思路重写的量化筛选算法（当前实现为 ZScoreMomentum / z_score_diff 阈值信号）作为一级过滤器，将 AI 的角色从“每分钟巡检”转变为“按需验证”，显著降低成本并提高信号质量。*
 
 ## 2. 核心工作流
 
 ### 2.1 第一层：量化筛选 (Quant Filter)
-- **核心算法**: 基于 Pine Script 逻辑的多种量化策略组合。
+- **核心算法**: 基于 Pine Script 思路重写的量化筛选算法（当前实现：`ZScoreMomentum`，用 `z_score_diff` 阈值穿越生成 long/short 信号）。
   - **逻辑**: 综合计算价格、成交量及波动率等统计特征，识别潜在的趋势突破信号。（具体算法细节见后文专章）
 - **运行机制**: 对给定的股票列表，系统实时运行该算法，持续监控每一分钟的 K 线收盘状态。
 - **触发**: 只有当算法检测到明确的“潜在突破信号”时，才会激活第二层 AI 验证。
 
 ### 2.2 第二层：AI 深度验证 (AI Verification)
-一旦量化层发出信号，系统立即向 **Gemini 3 Pro** 发起请求，进行多模态验证。
+一旦量化层发出信号，系统立即向 **gemini-3-flash-preview** 发起请求，进行多模态验证。
 - **输入数据**:
-  1. **市场数据**: 过去 30 分钟的 OHLCV 序列。
-  2. **技术指标**: 过去 30 分钟的 EMA9, EMA21, Volume, VWAP, Bollinger Bands 序列。
+  1. **市场数据**: 过去约 300 分钟的 1m OHLCV（用于计算指标与形态上下文），并在 Prompt 中重点展示最近 60 分钟的价格行为摘要。
+  2. **技术指标**: 基于上述 1m 数据计算的 EMA9, EMA21, VWAP, Bollinger Bands, MACD（并提供最新一根 bar 的关键数值）。
   3. **视觉数据**: 生成的当日盘中完整的 K 线图图片，叠加指标、压力位（Resistance）和支撑位（Support）及量化算法标记出的突破点位。
   4. **期权链数据 (Option Chain)**: 用于在 `buy_long/buy_short` 时选择合约（到期日、行权价）并校验点差/流动性约束。
+
+#### 2.2.1 期权链数据获取（新需求：同时支持实时与历史）
+为满足 **Replay Dashboard（历史回放）** 与 **Real-time Ticker Tracking（实时追踪）** 两类场景，系统需要同时支持：
+- **实时期权链（Real-time Option Chain）**：用于实时追踪页给 LLM/用户提供最新的到期日与行权价候选集合，并能拿到最新 bid/ask（用于点差与流动性过滤）。
+- **历史期权链（Historical Option Chain）**：用于回放页在某个历史时间点构造“当时可交易的到期日/行权价候选集合”，用于让 LLM 选择合约并生成 `trade_plan`。
+
+基于 Alpaca Options Data API（见 `alpacaAPIDoc/options_api.md`），可用的数据能力包括：
+- **链快照/实时链（REST Snapshot）**：`GET /v1beta1/options/snapshots/{underlying_symbol_or_symbols}` 获取期权合约最新 trade/quote/greeks/IV（用于实时链的报价层）。
+- **历史数据（REST Historical）**：
+  - `GET /v1beta1/options/bars`：期权合约 1Min 历史 OHLCV。
+  - `GET /v1beta1/options/quotes`：期权合约历史 bid/ask（用于“历史时间点”的点差评估）。
+  - `GET /v1beta1/options/trades`：期权合约历史成交（可选，用于更真实的成交/流动性评估）。
+- **实时数据（WebSocket）**：`wss://stream.data.alpaca.markets/v1beta1/options` 订阅 quotes/trades（用于对选定的一小批合约做实时更新）。
+
+工程落地需要额外补齐的关键点（实现约束）：
+- **合约列表来源（到期日/行权价宇宙）**：快照/历史 bars/quotes 都要求传入“期权合约 symbols”。因此系统必须具备“从 underlying -> 枚举 option contract symbols（按到期日/行权价/看涨看跌）”的能力；该能力将作为 Option Chain 的元数据层（contracts universe）。
+- **输出格式（给 LLM 的 option_chain 结构）**：至少包含 `right(call/put)`, `expiration`, `strike`, `symbol`, `bid`, `ask`, `spread`, `mid`（可选 greeks/IV/OI/volume）。
+- **过滤规则（默认）**：只保留**最近到期日（nearest expiration）**的一组合约，并在该到期日下保留**接近 ATM 的若干档 strike 的所有报价**（calls + puts）。
+
+项目后端将新增以下 Options 相关 API（供前端与分析服务复用）：
+- `GET /api/options/contracts?underlying=...`：枚举可交易合约（到期日/行权价/put-call/symbol）。
+- `GET /api/options/chain?underlying=...&asof=...&strikes_around_atm=N`：返回最近到期日 + ATM 附近若干档 strikes 的 calls/puts 报价集合。
+- `GET /api/options/quotes?symbols=...&start=...&end=...`：回放/历史点差评估用的历史 bid/ask。
+- `GET /api/options/bars?symbols=...&start=...&end=...`：回放/研究用的期权 1m bars。
 - **验证任务**:
   - 产出结构化 `action`：`buy_long / buy_short / ignore / follow_up / check_when_condition_meet`。
   - 若 `action = follow_up`：按 LLM 指示在**下一根 1m K 线收盘**继续验证（再次调用 LLM）。
-  - 若 `action = check_when_condition_meet`：按 `watch_condition` 设置本地触发器，**条件触发时**再次调用 LLM 继续验证。
+  - 若 `action = check_when_condition_meet`：按 `watch_condition` 设置本地触发器（`trigger_price` 为**标的（underlying）价格**，非期权价格），**条件触发时**再次调用 LLM 继续验证。
   - 若 `action = buy_long | buy_short`：为节省 LLM call，“期权交易计划”在**同一次**点位验证响应中一并产出，用于直接下 Alpaca paper trading 订单 （在Enable Alpaca Paper Trading Auth Trading时）。
 
 ### 2.3 第三层：交易生命周期编排 (Trade Orchestration)
@@ -31,8 +55,7 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 
 - **核心原则**:
   1) **LLM 决策，系统 paper trading 执行（需开关开启）**：仅当 Settings 中启用 “Enable Alpaca Paper Trading Auto Trading” 时，系统才会根据 LLM 的交易计划自动提交 Alpaca paper trading 订单；否则只提示信号、不下单。开启后，系统使用 Alpaca paper trading API 真实下单，并以订单回报与成交记录作为结算与复盘事实来源。
-  2) **降频优先（以触发为主）**：持仓管理优先用止盈/止损/时间止损等触发器自动执行；需要额外判断时再调用 LLM。
-  3) **一致性与可追溯**：每一笔交易都有 `trade_id`，每次 AI 决策都有 `analysis_id`，所有更新都附带“基于哪些事实做出改变”。
+  2) **一致性与可追溯**：每一笔交易都有 `trade_id`，每次 AI 决策都有 `analysis_id`，所有更新都附带“基于哪些事实做出改变”。
 
 - **交易状态机 (FSM)**:
   - `SCAN`：量化引擎持续扫描（当前实现：ZScoreMomentum / z_score_diff 阈值穿越生成 long/short 信号）。
@@ -43,8 +66,32 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
   - `PLAN_READY`：仅当 `action = buy_long | buy_short`，且该次 AI_VERIFY 响应中已包含期权交易计划，进入可执行态。
   - `ENTRY_PENDING`：仅当启用 “Enable Alpaca Paper Trading Auto Trading” 时，系统才向 Alpaca paper trading 提交期权入场限价单，这里的限价单默认为 ask_price + 0.03，尽量保证立马成交；若从下单到**下一根 1m K 线收盘**仍未成交，则撤单并结束，放弃该入场点并继续寻找下一个入场点。未启用时不下单，停留在提示/观察态。
   - `IN_POSITION`：入场单成交后进入持仓，自行挂止盈止损单；每根 1m K 线收盘时系统向 LLM 发起一次“卖出点位判断”请求，LLM 输出持仓管理动作（hold/全平/部分平仓/调整止盈止损/更新时间止损等）；若启用 “Enable Alpaca Paper Trading Auto Trading”，系统按该动作自动提交对应的 Alpaca paper trading 平仓/改单；同时系统持续监控止盈/止损/时间止损等硬规则，触发时进入 `EXIT_PENDING`。
-  - `EXIT_PENDING`：当所有合约已被平仓（例如 LLM 输出 close_all/close_partial 导致全部卖出 / 止盈触发 / 止损触发 / 时间止损触发），进入平仓结算流程；系统按触发条件使用不同的平仓订单类型（见下方执行模型），并基于 Alpaca 的成交回报自动计算 PnL、生成交易记录并落库。
+  - `EXIT_PENDING`：当 `contracts_remaining == 0`（所有合约均已平仓）时进入平仓结算流程；平仓可能由 LLM 动作（close_all / close_partial 直到清零）或止盈/止损/时间止损等规则触发导致。系统按触发条件使用不同的平仓订单类型（见下方执行模型）。**PnL 仅在启用 Alpaca paper trading 且有真实成交回报（fills）时计算**；Replay 回放模式不计算 PnL。
   - `CLOSED`：平仓完成，订单回报、成交与结算记录均已落库。
+
+- **并发与冲突规则（实现约束）**：
+  - **每个 symbol 严格串行（per-symbol sequential）**：系统按 1m bar 收盘逐根处理，同一 symbol 同一时刻只会有一个活跃候选入场点，因此不会出现多个 `ENTRY_CANDIDATE` 并存。
+  - **FOLLOW_UP_PENDING / WATCH_PENDING 的定位**：它们是对 `AI_VERIFY` 的“额外触发点位”，用于决定何时再次进入 `AI_VERIFY`，并不与 `SCAN` 停止/互斥。
+  - **同一根 K 线多触发合并**：若同一根 1m bar 收盘同时满足 `SCAN` 信号与 `WATCH_PENDING` 触发条件，系统只调用 LLM **一次**，并以该次 `AI_VERIFY` 的结果更新状态机（避免重复推理与 UI 重复事件）。
+
+- **交易记录与事件落库（新需求）**：
+  - **目标**：为交易闭环提供“事实账本”，支撑后续复盘、回测对齐、以及 UI 的交易时间线展示。
+  - **数据模型**：
+    - `trades`：每笔交易一行，主键 `trade_id`；包含 `symbol`、`mode(realtime|replay)`、`execution(paper|simulated)`、期权合约信息（`option_symbol/right/expiration/strike`）、`contracts_total`、`contracts_remaining`、入场/出场时间与 premium；**PnL 汇总字段仅在 `execution=paper` 时写入**，Replay/Simulated 保持为空。
+    - `trade_events`：每次状态变化/LLM 决策/下单或模拟成交/风控触发一条事件；包含 `trade_id`、`timestamp`、`event_type`、`analysis_id`（可选）、`bar_time`（可选）以及结构化 `payload`。
+      - `event_type` 最小枚举（建议）：
+        - `signal_detected`：量化层触发入场候选点（SCAN → ENTRY_CANDIDATE）。
+        - `ai_verify_requested`：发起点位验证请求（进入 AI_VERIFY）。
+        - `ai_verify_result`：点位验证结果返回（action + trade_plan/null）。
+        - `entry_submitted`：提交入场订单（paper trading）或生成模拟入场（replay）。
+        - `entry_filled`：入场成交（paper fills）或模拟成交确认（replay）。
+        - `position_mgmt_requested`：每根 1m 收盘发起持仓管理决策请求（IN_POSITION）。
+        - `position_mgmt_result`：持仓管理决策返回（hold/close/adjust 等）。
+        - `exit_submitted`：提交平仓订单（paper trading）或生成模拟平仓（replay）。
+        - `exit_filled`：平仓成交（paper fills）或模拟平仓确认（replay）。
+        - `risk_triggered`：止盈/止损/时间止损等规则触发（可附 `payload.trigger_type`）。
+        - `trade_closed`：交易结束并写入最终状态（CLOSED）。
+  - **Replay 策略**：回放模式同样写入落库，但 `mode=replay` 且 `execution=simulated`，便于与 realtime/paper 的交易记录并存对比。
 
 - **LLM 在一笔交易里要做的事情**:
   1) **点位验证 + 期权交易计划 (Verify + Option Plan)**：输出 `buy_long/buy_short/ignore/follow_up/check_when_condition_meet`；若为 `buy_long/buy_short`，在同一次响应中输出期权交易计划（合约 + 止盈/止损/时间止损），用于直接下 Alpaca paper trading 订单。
@@ -56,7 +103,7 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
   - **时间触发**：0DTE 接近特定时刻（例如 10:00/11:00/13:30 PST）或持仓超过 `max_hold_minutes`。
   - **波动触发**：瞬时波动/点差扩大（提示流动性风险，可能提前锁利）。
 
-- **利润计算（系统侧，LLM 使用结果做叙述）**:
+- **利润计算（仅 paper trading）**:
   - **期权 PnL（以 Alpaca paper trading 成交回报为准）**：系统以 Alpaca paper trading 的成交回报（fills）为唯一真相来源，计算 `pnl_option_usd`；公式仅作为说明：`pnl_option_usd = (exit_premium - entry_premium) * contracts * 100`（做空相反；买 call/put 都适用）。
   - **标准化指标**：同样基于成交回报计算的 `pnl_option_usd`：`R_multiple = pnl_option_usd / (abs(entry_premium - stop_premium) * contracts * 100)`，并记录最大回撤、持仓时长。
 
@@ -72,6 +119,7 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 为了让 LLM 真正完成“点位验证→入场→出场→结算”的闭环，同时尽量减少 LLM call，需要把输出从单一的 `action` 扩展为“点位验证（buy 时同时包含交易计划）/持仓管理（close 时包含结算与复盘）”两类结构化消息。
 
 #### 2.4.1 点位验证 + 交易计划（同一次 call；buy_long/buy_short 时返回 trade_plan）
+**（新需求 / 工程约束）后端响应 Schema 需要同步扩展**：`/api/analyze` 的响应模型 `LLMAnalysisResponse` 必须新增 `trade_plan` 字段，用于在 `action = buy_long | buy_short` 时承载完整期权交易计划，作为 Trade Orchestration 的输入。除 `buy_long/buy_short` 外，`trade_plan` 必须为 `null`。
 **A) buy_long（同次返回 trade_plan）**
 ```jsonc
 {
@@ -164,7 +212,7 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 }
 ```
 
-**E) check_when_condition_meet（挂 watch_condition，触发后再验证）**
+**E) check_when_condition_meet（挂 watch_condition，触发后再验证）**（`watch_condition.trigger_price` 为标的（underlying）价格，非期权价格）
 ```jsonc
 {
   "analysis_id": "anl_01JXK0K8D9H1Q0W3S6T5U4V2X1",
@@ -185,6 +233,7 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 ```
 
 #### 2.4.2 持仓管理决策（默认按触发调用；action=close 时同一次输出结算与复盘）
+> 注：Replay 回放模式不计算 PnL；因此下方示例中的 `position.pnl` 仅在 `execution=paper`（Alpaca paper trading）时由系统侧基于 fills 计算并写入。
 **A) hold（继续持有，不做任何改单/下单）**
 ```jsonc
 {
@@ -560,3 +609,4 @@ Day Trade Copilot 是一个智能股票监控系统，旨在通过实时分析 1
 - **Database**:
   - **Time-series**: In-memory (Pandas DataFrame) for realtime window; Optional: TimescaleDB / InfluxDB for persistence.
   - **Cache**: Redis (Strategy Cache, Quant Signals).
+  - **Trades & Events**: SQLite（后端本地文件）用于落库 `trades` 与 `trade_events`（作为交易“事实账本”与 UI 时间线数据源）。

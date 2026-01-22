@@ -21,7 +21,15 @@ Output MUST be a valid JSON object matching the following schema:
   "reasoning": "concise explanation",
   "pattern_name": "string" (optional, required if action is buy_long/buy_short),
   "breakout_price": float (optional, required if action is buy_long/buy_short),
-  "watch_condition": { "trigger_price": float, "direction": "above"|"below", "expiry_minutes": int } (optional, ONLY used when action is "check_when_condition_meet", otherwise null)
+  "watch_condition": { "trigger_price": float, "direction": "above"|"below", "expiry_minutes": int } (optional, ONLY used when action is "check_when_condition_meet", otherwise null),
+  "trade_plan": {
+    "trade_id": "string",
+    "direction": "long" | "short",
+    "option": { "right": "call" | "put", "expiration": "YYYY-MM-DD", "strike": float },
+    "contracts": int,
+    "risk": { "stop_loss_premium": float, "time_stop_minutes": int },
+    "take_profit_premium": float
+  } (optional, REQUIRED when action is buy_long/buy_short; MUST be null otherwise)
 }
 
 Action Definitions:
@@ -31,4 +39,3 @@ Action Definitions:
 - follow_up: Potential setup but need to wait for the next candle for confirmation.
 - check_when_condition_meet: Setup looks good but price needs to cross a specific level (e.g. key resistance/support) first. In this case, you MUST provide "watch_condition".
 """
-

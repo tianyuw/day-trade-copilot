@@ -111,6 +111,162 @@ class AlpacaClient:
                 return data
             return []
 
+    async def get_option_contracts(
+        self,
+        underlying_symbols: list[str],
+        expiration_date_lte: str | None = None,
+        expiration_date_gte: str | None = None,
+        limit: int = 100,
+        page_token: str | None = None,
+    ) -> dict:
+        underlyings = [s.strip().upper() for s in underlying_symbols if s.strip()]
+        params: dict[str, str] = {"underlying_symbols": ",".join(underlyings), "limit": str(limit)}
+        if expiration_date_lte:
+            params["expiration_date_lte"] = expiration_date_lte
+        if expiration_date_gte:
+            params["expiration_date_gte"] = expiration_date_gte
+        if page_token:
+            params["page_token"] = page_token
+
+        url = f"{self._settings.alpaca_trading_base_url}/v2/options/contracts"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=self._headers, params=params)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_option_chain_snapshots(self, underlying_or_symbols: str, feed: str | None = None) -> dict:
+        q_feed = (feed or self._settings.alpaca_options_feed or "").strip().lower() or "indicative"
+        if q_feed not in {"indicative", "opra"}:
+            q_feed = "indicative"
+        params = {"feed": q_feed}
+        target = str(underlying_or_symbols).strip().upper()
+        url = f"{self._settings.alpaca_options_data_base_url}/options/snapshots/{target}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=self._headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                return data
+            return {}
+
+    async def get_option_bars(
+        self,
+        symbols: list[str],
+        timeframe: str = "1Min",
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        symbols_norm = [s.strip().upper() for s in symbols if s.strip()]
+        params: dict[str, str] = {"symbols": ",".join(symbols_norm), "timeframe": timeframe, "limit": str(limit)}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+
+        url = f"{self._settings.alpaca_options_data_base_url}/options/bars"
+        out: dict[str, list[dict]] = {s: [] for s in symbols_norm}
+        page_token: str | None = None
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for _ in range(20):
+                if page_token:
+                    params["page_token"] = page_token
+                else:
+                    params.pop("page_token", None)
+
+                r = await client.get(url, headers=self._headers, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                raw = payload.get("bars", {}) if isinstance(payload, dict) else {}
+                if isinstance(raw, dict):
+                    for sym, bars in raw.items():
+                        if isinstance(bars, list):
+                            out.setdefault(sym, []).extend(bars)
+
+                page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+                if not page_token:
+                    break
+        return out
+
+    async def get_option_quotes(
+        self,
+        symbols: list[str],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        symbols_norm = [s.strip().upper() for s in symbols if s.strip()]
+        params: dict[str, str] = {"symbols": ",".join(symbols_norm), "limit": str(limit)}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+
+        url = f"{self._settings.alpaca_options_data_base_url}/options/quotes"
+        out: dict[str, list[dict]] = {s: [] for s in symbols_norm}
+        page_token: str | None = None
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for _ in range(20):
+                if page_token:
+                    params["page_token"] = page_token
+                else:
+                    params.pop("page_token", None)
+
+                r = await client.get(url, headers=self._headers, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                raw = payload.get("quotes", {}) if isinstance(payload, dict) else {}
+                if isinstance(raw, dict):
+                    for sym, quotes in raw.items():
+                        if isinstance(quotes, list):
+                            out.setdefault(sym, []).extend(quotes)
+
+                page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+                if not page_token:
+                    break
+        return out
+
+    async def get_option_trades(
+        self,
+        symbols: list[str],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        symbols_norm = [s.strip().upper() for s in symbols if s.strip()]
+        params: dict[str, str] = {"symbols": ",".join(symbols_norm), "limit": str(limit)}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+
+        url = f"{self._settings.alpaca_options_data_base_url}/options/trades"
+        out: dict[str, list[dict]] = {s: [] for s in symbols_norm}
+        page_token: str | None = None
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for _ in range(20):
+                if page_token:
+                    params["page_token"] = page_token
+                else:
+                    params.pop("page_token", None)
+
+                r = await client.get(url, headers=self._headers, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                raw = payload.get("trades", {}) if isinstance(payload, dict) else {}
+                if isinstance(raw, dict):
+                    for sym, trades in raw.items():
+                        if isinstance(trades, list):
+                            out.setdefault(sym, []).extend(trades)
+
+                page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+                if not page_token:
+                    break
+        return out
+
     async def stream_minute_bars(self, symbols: Iterable[str]) -> AsyncIterator[tuple[str, AlpacaBar]]:
         symbols_list = [s.strip().upper() for s in symbols if s.strip()]
         if not symbols_list:

@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca_client import AlpacaClient
 from .openrouter_client import OpenRouterClient
 from .analysis_service import AnalysisService
+from .options_service import OptionChainService
 from .schemas import (
     AIVerificationRequest,
     StreamBarMessage,
@@ -20,6 +21,8 @@ from .schemas import (
     StreamAnalysisMessage,
     LLMAnalysisRequest,
     LLMAnalysisResponse,
+    PositionManagementRequest,
+    PositionManagementResponse,
     TradingSettings,
 )
 from .settings import get_settings
@@ -32,6 +35,7 @@ def create_app() -> FastAPI:
     alpaca = AlpacaClient(settings)
     ai = OpenRouterClient(settings)
     analysis_service = AnalysisService(alpaca)
+    option_chain_service = OptionChainService(alpaca)
     assets_lock = asyncio.Lock()
     assets_cache: dict[str, object] = {"expires_at": 0.0, "assets": []}
     assets_ttl_seconds = 6 * 60 * 60
@@ -199,6 +203,59 @@ def create_app() -> FastAPI:
 
         return {"prev_close": prev_close}
 
+    @app.get("/api/options/contracts")
+    async def options_contracts(
+        underlying: Annotated[str, Query(min_length=1)],
+        expiration_date_lte: Annotated[str | None, Query()] = None,
+        expiration_date_gte: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ) -> dict:
+        contracts = await option_chain_service.get_contracts(
+            underlying=underlying,
+            asof_date=expiration_date_gte,
+            expiration_date_lte=expiration_date_lte,
+            expiration_date_gte=expiration_date_gte,
+            limit=limit,
+        )
+        return {"option_contracts": contracts}
+
+    @app.get("/api/options/chain")
+    async def options_chain(
+        underlying: Annotated[str, Query(min_length=1)],
+        asof: Annotated[str | None, Query()] = None,
+        strikes_around_atm: Annotated[int, Query(ge=0, le=50)] = 5,
+        feed: Annotated[str | None, Query()] = None,
+    ) -> dict:
+        return await option_chain_service.build_chain(
+            underlying=underlying,
+            asof=asof,
+            strikes_around_atm=strikes_around_atm,
+            options_feed=feed,
+        )
+
+    @app.get("/api/options/quotes")
+    async def options_quotes(
+        symbols: Annotated[str, Query(min_length=1)],
+        start: Annotated[str | None, Query()] = None,
+        end: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=10000)] = 1000,
+    ) -> dict:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        quotes = await alpaca.get_option_quotes(symbol_list, start=start, end=end, limit=limit)
+        return {"quotes": quotes}
+
+    @app.get("/api/options/bars")
+    async def options_bars(
+        symbols: Annotated[str, Query(min_length=1)],
+        timeframe: Annotated[str, Query()] = "1Min",
+        start: Annotated[str | None, Query()] = None,
+        end: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=10000)] = 1000,
+    ) -> dict:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        bars = await alpaca.get_option_bars(symbol_list, timeframe=timeframe, start=start, end=end, limit=limit)
+        return {"bars": bars}
+
     async def get_cached_assets() -> list[dict]:
         now = time.time()
         expires_at = float(assets_cache.get("expires_at") or 0.0)
@@ -271,6 +328,10 @@ def create_app() -> FastAPI:
     async def ai_verify(req: AIVerificationRequest) -> dict:
         res = await ai.verify(req)
         return res.model_dump()
+
+    @app.post("/api/ai/position_manage", response_model=PositionManagementResponse)
+    async def position_manage(req: PositionManagementRequest) -> PositionManagementResponse:
+        return await analysis_service.manage_position(req)
 
     @app.websocket("/ws/realtime")
     async def ws_realtime(

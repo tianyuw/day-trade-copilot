@@ -22,6 +22,10 @@ type Bar = {
   l: number
   c: number
   v?: number
+  ui_marker?: {
+    color: "green" | "red"
+    kind: "follow_up" | "watch"
+  }
   indicators?: {
     z_score_diff?: number
     signal?: "long" | "short"
@@ -78,6 +82,17 @@ function barsToMarkers(bars: Bar[]): SeriesMarker<Time>[] {
     const markers: SeriesMarker<Time>[] = []
     
     bars.forEach((b) => {
+        if (b.ui_marker) {
+            const time = toEpochSeconds(b.t) as Time
+            markers.push({
+                time,
+                position: "aboveBar",
+                color: b.ui_marker.color === "green" ? "#22c55e" : "#ef4444",
+                shape: "circle",
+                size: 1,
+            })
+        }
+
         if (!b.indicators?.signal) return
         
         const time = toEpochSeconds(b.t) as Time

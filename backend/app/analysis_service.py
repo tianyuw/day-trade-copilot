@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import time
+import json
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -13,14 +14,21 @@ from alpaca.data.timeframe import TimeFrame
 from .plotting import generate_chart_image
 from .llm_client import LLMClient
 from .llm_prompts import get_llm_system_prompt
-from .schemas import LLMAnalysisRequest, LLMAnalysisResponse
+from .schemas import (
+    LLMAnalysisRequest,
+    LLMAnalysisResponse,
+    PositionManagementRequest,
+    PositionManagementResponse,
+)
 from .indicators import ZScoreMomentum, MACD
+from .options_service import OptionChainService
 import os
 
 class AnalysisService:
     def __init__(self, alpaca_client: Any):
         self.alpaca = alpaca_client
         self.llm_client = LLMClient()
+        self.option_chain_service = OptionChainService(alpaca_client)
         self._analysis_cache: dict[str, tuple[float, LLMAnalysisResponse]] = {}
         self._analysis_inflight: dict[str, asyncio.Task[LLMAnalysisResponse]] = {}
         self._cache_lock = asyncio.Lock()
@@ -31,6 +39,19 @@ class AnalysisService:
             if os.getenv("GOOGLE_API_KEY")
             else os.getenv("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
         )
+        self._daily_bars_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        self._daily_bars_cache_ttl_seconds = 6 * 60 * 60
+
+    async def _get_daily_bars_df_cached(self, symbol: str, end: datetime) -> pd.DataFrame:
+        now = time.time()
+        cached = self._daily_bars_cache.get(symbol)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        start = end - timedelta(days=60)
+        df = await self._get_bars_df(symbol, "1Day", start, end, 100)
+        self._daily_bars_cache[symbol] = (time.time() + self._daily_bars_cache_ttl_seconds, df)
+        return df
 
     async def _get_bars_df(
         self,
@@ -436,6 +457,41 @@ Recent Price Action (Last 60 mins):
             t_str = b['t'].strftime('%H:%M')
             context_text += f"- {t_str}: O={b['o']:.2f}, H={b['h']:.2f}, L={b['l']:.2f}, C={b['c']:.2f}, V={b['v']}\n"
 
+        try:
+            strikes_around_atm = int(os.getenv("OPTION_CHAIN_STRIKES_AROUND_ATM", "5"))
+        except Exception:
+            strikes_around_atm = 5
+
+        try:
+            chain = await self.option_chain_service.build_chain(
+                underlying=symbol,
+                asof=request.current_time,
+                strikes_around_atm=strikes_around_atm,
+            )
+            exp = chain.get("expiration") if isinstance(chain, dict) else None
+            underlying_px = chain.get("underlying_price") if isinstance(chain, dict) else None
+            items = chain.get("items") if isinstance(chain, dict) else None
+            if exp and isinstance(items, list) and items:
+                px_text = ""
+                try:
+                    if underlying_px is not None:
+                        px_text = f", Underlying≈{float(underlying_px):.2f}"
+                except Exception:
+                    px_text = ""
+                context_text += f"\nOption Chain (Nearest Expiration: {exp}{px_text}):\n"
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    q = it.get("quote") if isinstance(it.get("quote"), dict) else {}
+                    bid = q.get("bid")
+                    ask = q.get("ask")
+                    right = it.get("right")
+                    strike = it.get("strike")
+                    opt_sym = it.get("symbol")
+                    context_text += f"- {opt_sym} {right} {strike}: bid={bid}, ask={ask}\n"
+        except Exception:
+            pass
+
         context_text += "\nBenchmark Context (Proxy Futures):\n"
         benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
         benchmark_alias = {"QQQ": "NQ", "SPY": "ES", "DIA": "YM", "IWM": "RTY"}
@@ -479,3 +535,229 @@ Recent Price Action (Last 60 mins):
 
         response = await self.llm_client.analyze_chart(request, chart_base64, context_text)
         return response
+
+    async def manage_position(self, req: PositionManagementRequest) -> PositionManagementResponse:
+        current_dt = datetime.fromisoformat(req.bar_time.replace("Z", "+00:00"))
+        if current_dt.tzinfo is None:
+            current_dt = current_dt.replace(tzinfo=ZoneInfo("UTC"))
+
+        symbol = req.symbol.strip().upper()
+
+        daily_bars = await self._get_daily_bars_df_cached(symbol, current_dt)
+        intraday_bars: pd.DataFrame
+
+        if req.ohlcv_1m:
+            intraday_bars = pd.DataFrame(req.ohlcv_1m)
+        else:
+            start = current_dt - timedelta(minutes=300)
+            intraday_bars = await self._get_bars_df(symbol, "1Min", start, current_dt, 1000)
+
+        if "timestamp" in intraday_bars.columns and not isinstance(intraday_bars.index, pd.DatetimeIndex):
+            intraday_bars["timestamp"] = pd.to_datetime(intraday_bars["timestamp"])
+            intraday_bars.set_index("timestamp", inplace=True)
+        elif "t" in intraday_bars.columns and not isinstance(intraday_bars.index, pd.DatetimeIndex):
+            intraday_bars["timestamp"] = pd.to_datetime(intraday_bars["t"])
+            intraday_bars.set_index("timestamp", inplace=True)
+        intraday_bars.sort_index(inplace=True)
+
+        if "timestamp" in daily_bars.columns and not isinstance(daily_bars.index, pd.DatetimeIndex):
+            daily_bars["timestamp"] = pd.to_datetime(daily_bars["timestamp"])
+            daily_bars.set_index("timestamp", inplace=True)
+        elif "t" in daily_bars.columns and not isinstance(daily_bars.index, pd.DatetimeIndex):
+            daily_bars["timestamp"] = pd.to_datetime(daily_bars["t"])
+            daily_bars.set_index("timestamp", inplace=True)
+        daily_bars.sort_index(inplace=True)
+
+        daily_records = daily_bars.reset_index().to_dict("records") if not daily_bars.empty else []
+        daily_for_z = [{"c": r["close"], "t": r["timestamp"]} for r in daily_records if "close" in r and "timestamp" in r]
+
+        z_indicator = ZScoreMomentum(daily_for_z)
+        macd_indicator = MACD()
+
+        intraday_records_df = intraday_bars.reset_index()
+        if "timestamp" not in intraday_records_df.columns and "t" in intraday_records_df.columns:
+            intraday_records_df["timestamp"] = pd.to_datetime(intraday_records_df["t"])
+        intraday_records = intraday_records_df.to_dict("records")
+
+        df = intraday_bars.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df.set_index("timestamp", inplace=True)
+            elif "t" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["t"])
+                df.set_index("timestamp", inplace=True)
+
+        df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+        df["bb_middle"] = df["close"].rolling(window=20).mean()
+        df["bb_std"] = df["close"].rolling(window=20).std()
+        df["bb_upper"] = df["bb_middle"] + (df["bb_std"] * 2)
+        df["bb_lower"] = df["bb_middle"] - (df["bb_std"] * 2)
+        df["vwap"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum() / df["volume"].cumsum()
+
+        bars_with_indicators: list[dict[str, Any]] = []
+        indicators_list: list[dict[str, Any]] = []
+
+        for i, row in enumerate(intraday_records):
+            close = row["close"]
+            z_res = z_indicator.update(close)
+            m_res = macd_indicator.update(close)
+
+            ts = row.get("timestamp")
+            if ts is None and row.get("t") is not None:
+                ts = pd.to_datetime(row["t"])
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.to_datetime(ts)
+
+            try:
+                pd_row = df.loc[ts]
+                if isinstance(pd_row, pd.DataFrame):
+                    pd_row = pd_row.iloc[0]
+            except Exception:
+                pd_row = df.iloc[i]
+
+            indicators_list.append(
+                {
+                    "ema9": float(pd_row["ema9"]),
+                    "ema21": float(pd_row["ema21"]),
+                    "vwap": float(pd_row["vwap"]),
+                    "bb_upper": float(pd_row["bb_upper"]) if pd.notna(pd_row["bb_upper"]) else float("nan"),
+                    "bb_middle": float(pd_row["bb_middle"]) if pd.notna(pd_row["bb_middle"]) else float("nan"),
+                    "bb_lower": float(pd_row["bb_lower"]) if pd.notna(pd_row["bb_lower"]) else float("nan"),
+                    "macd_dif": m_res.get("macd_dif"),
+                    "macd_dea": m_res.get("macd_dea"),
+                    "macd_hist": m_res.get("macd_hist"),
+                    "z_score_diff": z_res.get("z_score_diff"),
+                }
+            )
+            bars_with_indicators.append(
+                {
+                    "t": ts,
+                    "o": row["open"],
+                    "h": row["high"],
+                    "l": row["low"],
+                    "c": row["close"],
+                    "v": row.get("volume", 0),
+                }
+            )
+
+        plot_bars = bars_with_indicators[-60:]
+        plot_indicators = indicators_list[-60:]
+        chart_base64 = generate_chart_image(plot_bars, plot_indicators)
+
+        prev_day_high = 0.0
+        prev_day_low = 0.0
+        prev_day_close = 0.0
+        if daily_records:
+            last_day = daily_records[-1]
+            prev_day_close = float(last_day.get("close", 0.0) or 0.0)
+            prev_day_high = float(last_day.get("high", 0.0) or 0.0)
+            prev_day_low = float(last_day.get("low", 0.0) or 0.0)
+
+        open_price = float(intraday_records[0]["open"]) if intraday_records else 0.0
+        today_str = current_dt.strftime("%Y-%m-%d")
+        df_today = df[df.index.strftime("%Y-%m-%d") == today_str]
+        if not df_today.empty:
+            day_high = float(df_today["high"].max())
+            day_low = float(df_today["low"].min())
+            open_price = float(df_today.iloc[0]["open"])
+        else:
+            day_high = 0.0
+            day_low = 0.0
+
+        latest_close = float(intraday_records[-1]["close"]) if intraday_records else 0.0
+        daily_trend = ", ".join([f"{float(r['close']):.2f}" for r in daily_records if "close" in r])
+
+        context_text = f"""
+Timestamp (PST): {current_dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime('%Y-%m-%d %H:%M:%S')}
+Symbol: {symbol}
+
+Daily Stats (Last 60 Days):
+- Daily Trend (Last 60 Days): {daily_trend}
+
+Previous Day Stats:
+- Close: {prev_day_close:.2f}
+- High: {prev_day_high:.2f}
+- Low: {prev_day_low:.2f}
+
+Intraday Stats:
+- Open: {open_price:.2f}
+- Day High: {day_high:.2f}
+- Day Low: {day_low:.2f}
+- Current Price: {latest_close:.2f}
+
+Technical Indicators (Latest):
+- EMA9: {indicators_list[-1]['ema9']:.2f}
+- EMA21: {indicators_list[-1]['ema21']:.2f}
+- VWAP: {indicators_list[-1]['vwap']:.2f}
+- Bollinger Upper: {indicators_list[-1]['bb_upper']:.2f}
+- Bollinger Middle: {indicators_list[-1]['bb_middle']:.2f}
+- Bollinger Lower: {indicators_list[-1]['bb_lower']:.2f}
+- MACD DIF: {indicators_list[-1]['macd_dif']:.3f}
+- MACD DEA: {indicators_list[-1]['macd_dea']:.3f}
+- MACD Hist: {indicators_list[-1]['macd_hist']:.3f}
+
+Recent Price Action (Last 60 mins):
+"""
+        for b in bars_with_indicators[-60:]:
+            t_str = b["t"].strftime("%H:%M")
+            context_text += f"- {t_str}: O={b['o']:.2f}, H={b['h']:.2f}, L={b['l']:.2f}, C={b['c']:.2f}, V={b['v']}\n"
+
+        context_text += "\nPosition Context:\n"
+        context_text += json.dumps(req.position.model_dump(), ensure_ascii=False) + "\n"
+
+        if req.option_symbol:
+            try:
+                end_iso = current_dt.isoformat().replace("+00:00", "Z")
+                start_iso = (current_dt - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+                quotes = await self.alpaca.get_option_quotes([req.option_symbol], start=start_iso, end=end_iso, limit=1000)
+                rows = quotes.get(req.option_symbol, []) if isinstance(quotes, dict) else []
+                last = rows[-1] if rows else None
+                if isinstance(last, dict):
+                    context_text += f"Option Quote:\n- {req.option_symbol}: bid={last.get('bp')}, ask={last.get('ap')}, t={last.get('t')}\n"
+            except Exception:
+                pass
+
+        context_text += "\nBenchmark Context (Proxy Futures):\n"
+        benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
+        benchmark_alias = {"QQQ": "NQ", "SPY": "ES", "DIA": "YM", "IWM": "RTY"}
+        bench_daily_end = current_dt
+        bench_daily_start = current_dt - timedelta(days=450)
+        bench_intraday_start = current_dt - timedelta(minutes=300)
+
+        for bsym in benchmark_symbols:
+            df_b_daily = await self._get_bars_df(bsym, "1Day", bench_daily_start, bench_daily_end, 500)
+            df_b_intra = await self._get_bars_df(bsym, "1Min", bench_intraday_start, current_dt, 1000)
+
+            b_last = float(df_b_intra["close"].iloc[-1]) if not df_b_intra.empty else (float(df_b_daily["close"].iloc[-1]) if not df_b_daily.empty else 0.0)
+            b_prev_high = float(df_b_daily["high"].iloc[-1]) if not df_b_daily.empty and "high" in df_b_daily.columns else 0.0
+            b_prev_low = float(df_b_daily["low"].iloc[-1]) if not df_b_daily.empty and "low" in df_b_daily.columns else 0.0
+
+            b_sma20 = self._sma_last(df_b_daily["close"], 20) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma50 = self._sma_last(df_b_daily["close"], 50) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma100 = self._sma_last(df_b_daily["close"], 100) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+            b_sma200 = self._sma_last(df_b_daily["close"], 200) if not df_b_daily.empty and "close" in df_b_daily.columns else None
+
+            alias = benchmark_alias.get(bsym)
+            alias_text = f"(≈ {alias})" if alias else ""
+            context_text += f"""
+- {bsym} {alias_text}
+  - Current Price: {b_last:.2f}
+  - Previous Day High: {b_prev_high:.2f}
+  - Previous Day Low: {b_prev_low:.2f}
+  - Daily SMA20: {b_sma20 if b_sma20 is not None else "N/A"}
+  - Daily SMA50: {b_sma50 if b_sma50 is not None else "N/A"}
+  - Daily SMA100: {b_sma100 if b_sma100 is not None else "N/A"}
+  - Daily SMA200: {b_sma200 if b_sma200 is not None else "N/A"}
+  - Recent 1m Price Action (Last 20 mins):
+"""
+            if not df_b_intra.empty:
+                df_tail = df_b_intra.tail(20)
+                for ts_i, r_i in df_tail.iterrows():
+                    t_str = ts_i.strftime("%H:%M")
+                    context_text += f"    - {t_str}: O={float(r_i['open']):.2f}, H={float(r_i['high']):.2f}, L={float(r_i['low']):.2f}, C={float(r_i['close']):.2f}, V={float(r_i.get('volume', 0))}\n"
+            else:
+                context_text += "    - N/A\n"
+
+        return await self.llm_client.manage_position(req, chart_base64, context_text)
