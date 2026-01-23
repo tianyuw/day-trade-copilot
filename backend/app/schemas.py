@@ -130,6 +130,8 @@ class AIVerificationRequest(BaseModel):
 
 class TradingSettings(BaseModel):
     paper_auto_trade_enabled: bool = False
+    live_trading_enabled: bool = False
+    default_execution: Literal["paper", "live"] = "paper"
 
 
 class PositionOption(BaseModel):

@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { MiniCandleChart } from "../../components/CandleCard"
+import { TrackingMiniChart } from "../../components/TrackingMiniChart"
 import { cn } from "../../components/cn"
 
 type StreamInit = {
@@ -464,7 +464,7 @@ export default function TrackingPage() {
                     </div>
 
                     <div className="mt-3">
-                      <MiniCandleChart bars={bars.slice(-120)} />
+                      <TrackingMiniChart bars={bars} />
                     </div>
                   </div>
                 </Link>

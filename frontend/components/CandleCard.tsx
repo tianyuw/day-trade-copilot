@@ -79,35 +79,37 @@ function barsToCandles(
 }
 
 function barsToMarkers(bars: Bar[]): SeriesMarker<Time>[] {
-    const markers: SeriesMarker<Time>[] = []
-    
-    bars.forEach((b) => {
-        if (b.ui_marker) {
-            const time = toEpochSeconds(b.t) as Time
-            markers.push({
-                time,
-                position: "aboveBar",
-                color: b.ui_marker.color === "green" ? "#22c55e" : "#ef4444",
-                shape: "circle",
-                size: 1,
-            })
-        }
+  const byTime = new Map<number, SeriesMarker<Time>>()
 
-        if (!b.indicators?.signal) return
-        
-        const time = toEpochSeconds(b.t) as Time
-        const isLong = b.indicators.signal === "long"
-        
-        markers.push({
-            time,
-            position: 'aboveBar',
-            color: isLong ? '#22c55e' : '#ef4444', // Green-500 : Red-500
-            shape: 'circle',
-            size: 1, // default is 1, can be adjusted
-        })
-    })
-    
-    return markers.sort((a, b) => Number(a.time) - Number(b.time))
+  for (const b of bars) {
+    const time = toEpochSeconds(b.t)
+    if (!Number.isFinite(time)) continue
+
+    if (b.ui_marker) {
+      byTime.set(time, {
+        time: time as Time,
+        position: "aboveBar",
+        color: b.ui_marker.color === "green" ? "#22c55e" : "#ef4444",
+        shape: "circle",
+        size: 1,
+      })
+      continue
+    }
+
+    if (!b.indicators?.signal) continue
+    const isLong = b.indicators.signal === "long"
+    if (!byTime.has(time)) {
+      byTime.set(time, {
+        time: time as Time,
+        position: "aboveBar",
+        color: isLong ? "#22c55e" : "#ef4444",
+        shape: "circle",
+        size: 1,
+      })
+    }
+  }
+
+  return Array.from(byTime.values()).sort((a, b) => Number(a.time) - Number(b.time))
 }
 
 function barsToVolumes(bars: Bar[]): HistogramData<Time>[] {

@@ -111,6 +111,138 @@ class AlpacaClient:
                 return data
             return []
 
+    def _trading_base_and_headers(self, execution: str) -> tuple[str, dict[str, str]]:
+        ex = str(execution or "paper").strip().lower()
+        if ex == "live":
+            if not self._settings.alpaca_live_api_key or not self._settings.alpaca_live_secret_key:
+                raise RuntimeError("Live trading credentials are not configured")
+            return (
+                self._settings.alpaca_trading_base_url_live,
+                {
+                    "APCA-API-KEY-ID": self._settings.alpaca_live_api_key,
+                    "APCA-API-SECRET-KEY": self._settings.alpaca_live_secret_key,
+                },
+            )
+        return (
+            self._settings.alpaca_trading_base_url_paper,
+            {
+                "APCA-API-KEY-ID": self._settings.alpaca_paper_api_key,
+                "APCA-API-SECRET-KEY": self._settings.alpaca_paper_secret_key,
+            },
+        )
+
+    async def get_account(self, execution: str = "paper") -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/account"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def list_positions(self, execution: str = "paper") -> list[dict]:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/positions"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+
+    async def get_position(self, symbol: str, execution: str = "paper") -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/positions/{symbol}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def close_position(
+        self,
+        symbol: str,
+        execution: str = "paper",
+        qty: str | None = None,
+        percentage: str | None = None,
+    ) -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/positions/{symbol}"
+        params: dict[str, str] = {}
+        if qty is not None:
+            params["qty"] = str(qty)
+        if percentage is not None:
+            params["percentage"] = str(percentage)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.delete(url, headers=headers, params=params or None)
+            r.raise_for_status()
+            return r.json()
+
+    async def close_all_positions(self, execution: str = "paper") -> list[dict]:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/positions"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.delete(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+
+    async def submit_order(self, payload: dict, execution: str = "paper") -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def list_orders(self, execution: str = "paper", params: dict | None = None) -> list[dict]:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers, params=params or None)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+
+    async def get_order(self, order_id: str, execution: str = "paper") -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders/{order_id}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def cancel_order(self, order_id: str, execution: str = "paper") -> None:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders/{order_id}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.delete(url, headers=headers)
+            r.raise_for_status()
+            return None
+
+    async def cancel_all_orders(self, execution: str = "paper") -> list[dict]:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.delete(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+
+    async def replace_order(self, order_id: str, payload: dict, execution: str = "paper") -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/orders/{order_id}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.patch(url, headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def list_account_activities(self, execution: str = "paper", params: dict | None = None) -> list[dict]:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/account/activities"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers, params=params or None)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+
     async def get_option_contracts(
         self,
         underlying_symbols: list[str],

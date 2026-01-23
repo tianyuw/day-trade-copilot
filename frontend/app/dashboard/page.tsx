@@ -145,6 +145,8 @@ export default function DashboardPage() {
   const autoPausedRef = useRef(false)
   const queuedMessagesRef = useRef<StreamMessage[]>([])
   const drainInProgressRef = useRef(false)
+  const replaySessionIdRef = useRef(0)
+  const inflightFetchControllersRef = useRef<Set<AbortController>>(new Set())
 
   const fsmRef = useRef<{
     state: TradeStateName
@@ -199,6 +201,37 @@ export default function DashboardPage() {
   useEffect(() => {
     isPlayingRef.current = isPlaying
   }, [isPlaying])
+
+  const beginNewReplaySession = () => {
+    replaySessionIdRef.current += 1
+    return replaySessionIdRef.current
+  }
+
+  const abortAllInflightFetches = () => {
+    const ctrls = Array.from(inflightFetchControllersRef.current)
+    inflightFetchControllersRef.current.clear()
+    for (const c of ctrls) {
+      try { c.abort() } catch {}
+    }
+  }
+
+  const stopReplay = () => {
+    beginNewReplaySession()
+    isPlayingRef.current = false
+    intentionalCloseRef.current = true
+    try { wsRef.current?.close() } catch {}
+    queuedMessagesRef.current = []
+    autoPausedRef.current = false
+    fsmRef.current.manageInflight = false
+    abortAllInflightFetches()
+    setIsPlaying(false)
+  }
+
+  const startReplay = () => {
+    beginNewReplaySession()
+    isPlayingRef.current = true
+    setIsPlaying(true)
+  }
 
   const getBackendBase = () => {
     return (
@@ -392,11 +425,16 @@ export default function DashboardPage() {
   }
 
   const requestAnalyze = async (timeIso: string) => {
+      let controller: AbortController | null = null
       try {
+          const sessionId = replaySessionIdRef.current
+          controller = new AbortController()
+          inflightFetchControllersRef.current.add(controller)
           const base = getBackendBase()
           const res = await fetch(`${base}/api/analyze`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
+              signal: controller.signal,
               body: JSON.stringify({
                   symbol: selectedSymbol,
                   current_time: timeIso
@@ -406,12 +444,16 @@ export default function DashboardPage() {
           if (!res.ok) throw new Error("Analysis failed")
           
           const data = (await res.json()) as AnalysisResult
+          if (sessionId !== replaySessionIdRef.current || !isPlayingRef.current) return
           appendAIAnalysis(data, data?.timestamp ?? timeIso)
           await handleAIResultForFSM(data)
           
       } catch (e) {
+          if (e instanceof DOMException && e.name === "AbortError") return
           console.error(e)
           appendSystem(`Analysis Error: ${e instanceof Error ? e.message : 'Unknown error'}`, new Date().toISOString())
+      } finally {
+          if (controller) inflightFetchControllersRef.current.delete(controller)
       }
   }
 
@@ -420,7 +462,11 @@ export default function DashboardPage() {
     if (!trade) return
     if (fsmRef.current.manageInflight) return
     fsmRef.current.manageInflight = true
+    let controller: AbortController | null = null
     try {
+      const sessionId = replaySessionIdRef.current
+      controller = new AbortController()
+      inflightFetchControllersRef.current.add(controller)
       const base = getBackendBase()
       const ohlcv = barsRef.current.slice(-300).map((b) => ({
         t: b.t,
@@ -433,6 +479,7 @@ export default function DashboardPage() {
       const res = await fetch(`${base}/api/ai/position_manage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           trade_id: trade.trade_id,
           symbol: selectedSymbol,
@@ -451,6 +498,7 @@ export default function DashboardPage() {
       })
       if (!res.ok) throw new Error("Position manage failed")
       const data = (await res.json()) as PositionManagementResponse
+      if (sessionId !== replaySessionIdRef.current || !isPlayingRef.current) return
 
       const d = data.decision
       const summaryParts = [`POSITION_MGMT: ${d.action}`, d.reasoning]
@@ -490,10 +538,12 @@ export default function DashboardPage() {
         fsmRef.current.watches = []
       }
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return
       console.error(e)
       appendSystem(`Position Mgmt Error: ${e instanceof Error ? e.message : "Unknown error"}`, barTimeIso)
     } finally {
       fsmRef.current.manageInflight = false
+      if (controller) inflightFetchControllersRef.current.delete(controller)
     }
   }
 
@@ -532,7 +582,7 @@ export default function DashboardPage() {
       `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
     const url = `${base}/ws/playback?symbols=${encodeURIComponent(selectedSymbol)}&start=${encodeURIComponent(
       startRFC ?? "",
-    )}&speed=1&cursor=${encodeURIComponent(String(playbackCursorRef.current))}`
+    )}&speed=1&flow=ack&cursor=${encodeURIComponent(String(playbackCursorRef.current))}`
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -562,12 +612,17 @@ export default function DashboardPage() {
       }
 
       if (msg.type === "bar") {
-        if (typeof msg.i === "number") {
-          playbackCursorRef.current = msg.i + 1
-          setPlaybackCursor(msg.i + 1)
-        }
+        const ackI = typeof msg.i === "number" ? msg.i : null
+        const nextCursor = ackI != null ? ackI + 1 : null
+        const sessionId = replaySessionIdRef.current
+        try {
         if (msg.symbol === selectedSymbol) {
-          barsRef.current = [...barsRef.current, msg.bar].slice(-1000)
+          const last = barsRef.current[barsRef.current.length - 1]
+          if (last && String(last?.t ?? "") === String(msg.bar?.t ?? "")) {
+            barsRef.current = [...barsRef.current.slice(0, -1), msg.bar].slice(-1000)
+          } else {
+            barsRef.current = [...barsRef.current, msg.bar].slice(-1000)
+          }
           setBars(barsRef.current)
           const barTimeIso = String(msg.bar?.t ?? "")
           const hasQuantSignal = Boolean(msg.bar?.indicators?.signal)
@@ -614,6 +669,21 @@ export default function DashboardPage() {
               await runLLMBlocking(() => requestAnalyze(barTimeIso), processMessage)
             }
             return
+          }
+        }
+        } finally {
+          if (nextCursor != null) {
+            playbackCursorRef.current = nextCursor
+            setPlaybackCursor(nextCursor)
+          }
+          if (
+            ackI != null &&
+            isPlayingRef.current &&
+            sessionId === replaySessionIdRef.current &&
+            wsRef.current &&
+            wsRef.current.readyState === WebSocket.OPEN
+          ) {
+            wsRef.current.send(JSON.stringify({ type: "ack", i: ackI }))
           }
         }
         return
@@ -686,7 +756,7 @@ export default function DashboardPage() {
 
   // Reset handler
   const handleReset = () => {
-    setIsPlaying(false)
+    stopReplay()
     setBars([])
     playbackCursorRef.current = 0
     setPlaybackCursor(0)
@@ -703,7 +773,6 @@ export default function DashboardPage() {
 
   return (
     <main className="flex h-screen flex-col bg-neon-radial text-white font-sans overflow-hidden">
-
       {/* Top Control Bar */}
       <div className="flex-none border-b border-white/10 bg-black/20 backdrop-blur-xl px-6 py-4">
         <div className="mx-auto flex max-w-[1600px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -768,7 +837,8 @@ export default function DashboardPage() {
                   onClick={() => {
                     const next = !isPlaying
                     userPausedRef.current = !next
-                    setIsPlaying(next)
+                    if (next) startReplay()
+                    else stopReplay()
                   }}
                   className={`flex items-center gap-2 rounded-xl px-6 py-2.5 text-sm font-bold transition-all ${
                     isPlaying 

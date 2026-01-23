@@ -8,7 +8,8 @@ import { SettingsDrawer } from "./SettingsDrawer"
 
 export function NavigationBar() {
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [paperAutoTradeEnabled, setPaperAutoTradeEnabled] = useState(false)
+  const [tradingExecutionEnabled, setTradingExecutionEnabled] = useState(false)
+  const [defaultExecution, setDefaultExecution] = useState<"paper" | "live">("paper")
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -19,9 +20,11 @@ export function NavigationBar() {
 
   useEffect(() => {
     if (typeof window === "undefined") return
-    const raw = window.localStorage.getItem("paperAutoTradeEnabled")
-    if (raw === "true") setPaperAutoTradeEnabled(true)
-    if (raw === "false") setPaperAutoTradeEnabled(false)
+    const raw = window.localStorage.getItem("tradingExecutionEnabled")
+    if (raw === "true") setTradingExecutionEnabled(true)
+    if (raw === "false") setTradingExecutionEnabled(false)
+    const execRaw = window.localStorage.getItem("defaultExecution")
+    if (execRaw === "live" || execRaw === "paper") setDefaultExecution(execRaw)
   }, [])
 
   useEffect(() => {
@@ -30,42 +33,66 @@ export function NavigationBar() {
       try {
         const res = await fetch(`${baseHttp}/api/settings/trading`, { method: "GET" })
         if (!res.ok) return
-        const body = (await res.json()) as { paper_auto_trade_enabled?: unknown }
-        if (typeof body.paper_auto_trade_enabled !== "boolean") return
-        setPaperAutoTradeEnabled(body.paper_auto_trade_enabled)
-        window.localStorage.setItem("paperAutoTradeEnabled", String(body.paper_auto_trade_enabled))
+        const body = (await res.json()) as {
+          paper_auto_trade_enabled?: unknown
+          live_trading_enabled?: unknown
+          default_execution?: unknown
+        }
+        if (typeof body.paper_auto_trade_enabled === "boolean") {
+          setTradingExecutionEnabled(body.paper_auto_trade_enabled)
+          window.localStorage.setItem("tradingExecutionEnabled", String(body.paper_auto_trade_enabled))
+        }
+        if (body.default_execution === "paper" || body.default_execution === "live") {
+          setDefaultExecution(body.default_execution)
+          window.localStorage.setItem("defaultExecution", String(body.default_execution))
+        }
       } catch {
       }
     }
     run()
   }, [baseHttp])
 
-  const updatePaperAutoTradeEnabled = useCallback(
-    async (nextValue: boolean) => {
+  const saveSettings = useCallback(
+    async (next: { enabled?: boolean; execution?: "paper" | "live" }) => {
       if (!baseHttp) return
       setIsSaving(true)
       setError(null)
-      const previous = paperAutoTradeEnabled
-      setPaperAutoTradeEnabled(nextValue)
+      const prevEnabled = tradingExecutionEnabled
+      const prevExec = defaultExecution
+      if (typeof next.enabled === "boolean") setTradingExecutionEnabled(next.enabled)
+      if (next.execution) setDefaultExecution(next.execution)
       try {
-        window.localStorage.setItem("paperAutoTradeEnabled", String(nextValue))
+        if (typeof next.enabled === "boolean") {
+          window.localStorage.setItem("tradingExecutionEnabled", String(next.enabled))
+        }
+        if (next.execution) {
+          window.localStorage.setItem("defaultExecution", String(next.execution))
+        }
+        const enabled = typeof next.enabled === "boolean" ? next.enabled : prevEnabled
+        const execution = next.execution ?? prevExec
         const res = await fetch(`${baseHttp}/api/settings/trading`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ paper_auto_trade_enabled: nextValue }),
+          body: JSON.stringify({
+            paper_auto_trade_enabled: enabled,
+            live_trading_enabled: Boolean(enabled && execution === "live"),
+            default_execution: execution,
+          }),
         })
         if (!res.ok) {
           throw new Error("save_failed")
         }
       } catch {
-        setPaperAutoTradeEnabled(previous)
-        window.localStorage.setItem("paperAutoTradeEnabled", String(previous))
+        setTradingExecutionEnabled(prevEnabled)
+        setDefaultExecution(prevExec)
+        window.localStorage.setItem("tradingExecutionEnabled", String(prevEnabled))
+        window.localStorage.setItem("defaultExecution", String(prevExec))
         setError("Failed to save settings. Please try again.")
       } finally {
         setIsSaving(false)
       }
     },
-    [baseHttp, paperAutoTradeEnabled],
+    [baseHttp, tradingExecutionEnabled, defaultExecution],
   )
 
   return (
@@ -96,9 +123,11 @@ export function NavigationBar() {
       <SettingsDrawer
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
-        paperAutoTradeEnabled={paperAutoTradeEnabled}
-        onRequestEnablePaperAutoTrade={() => updatePaperAutoTradeEnabled(true)}
-        onDisablePaperAutoTrade={() => updatePaperAutoTradeEnabled(false)}
+        tradingExecutionEnabled={tradingExecutionEnabled}
+        defaultExecution={defaultExecution}
+        onRequestEnableTradingExecution={() => saveSettings({ enabled: true })}
+        onDisableTradingExecution={() => saveSettings({ enabled: false })}
+        onUpdateDefaultExecution={(execution) => saveSettings({ execution })}
         isSaving={isSaving}
         error={error}
       />
