@@ -38,7 +38,7 @@ class GoogleAPIClient:
             response = await model.generate_content_async(prompt_parts)
             content = response.text
             
-            print(f"DEBUG: Raw Google API Response Content: '{content}'")
+            #print(f"DEBUG: Raw Google API Response Content: '{content}'")
             
             if not content:
                 raise ValueError("Google API returned empty response content")

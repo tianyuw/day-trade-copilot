@@ -194,8 +194,8 @@ export function TrackingMiniChart({
   }, [candles, pctLine])
 
   return (
-    <div className={cn("h-24 w-full", className)}>
-      <div ref={containerRef} className="h-full w-full" />
+    <div className={cn("relative h-24 w-full overflow-hidden", className)}>
+      <div ref={containerRef} className="absolute inset-0 h-full w-full" />
     </div>
   )
 }

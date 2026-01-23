@@ -64,6 +64,7 @@ export function AICopilot({
 
     const knownKeys = new Set([
       "last_px",
+      "option_premium",
       "contracts",
       "direction",
       "option",
@@ -80,6 +81,7 @@ export function AICopilot({
     })
 
     const lastPx = kv.last_px
+    const optionPremium = kv.option_premium
     const contracts = kv.contracts
     const direction = kv.direction ? kv.direction.toUpperCase() : ""
     const option = kv.option
@@ -121,6 +123,10 @@ export function AICopilot({
           <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
             <span className="mr-1 opacity-50">Last Px:</span>
             {lastPx || "N/A"}
+          </div>
+          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
+            <span className="mr-1 opacity-50">Option Px:</span>
+            {optionPremium || "N/A"}
           </div>
           <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
             <span className="mr-1 opacity-50">Contracts:</span>

@@ -12,3 +12,24 @@ body {
   color: rgba(255, 255, 255, 0.92);
 }
 
+@keyframes borderFlow {
+  0% {
+    box-shadow: 0 0 16px rgba(45, 212, 191, 0.4), 0 0 0 0 rgba(45, 212, 191, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 28px rgba(45, 212, 191, 0.75), 0 0 0 6px rgba(45, 212, 191, 0.06);
+  }
+  100% {
+    box-shadow: 0 0 16px rgba(45, 212, 191, 0.4), 0 0 0 0 rgba(45, 212, 191, 0.0);
+  }
+}
+
+@keyframes bgPulse {
+  0%,
+  100% {
+    background-color: rgba(0, 0, 0, 0.35);
+  }
+  50% {
+    background-color: rgba(16, 185, 129, 0.16);
+  }
+}

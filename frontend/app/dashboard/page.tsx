@@ -437,7 +437,8 @@ export default function DashboardPage() {
               signal: controller.signal,
               body: JSON.stringify({
                   symbol: selectedSymbol,
-                  current_time: timeIso
+                  current_time: timeIso,
+                  mode: "playback",
               })
           })
           
@@ -484,6 +485,7 @@ export default function DashboardPage() {
           trade_id: trade.trade_id,
           symbol: selectedSymbol,
           bar_time: barTimeIso,
+          mode: "playback",
           position: {
             direction: trade.direction,
             option: trade.option,
@@ -505,6 +507,8 @@ export default function DashboardPage() {
       const lastBar = barsRef.current[barsRef.current.length - 1]
       const lastPx = typeof lastBar?.c === "number" ? lastBar.c : null
       summaryParts.push(`last_px=${lastPx ?? "N/A"}`)
+      const optPx = (data as any)?.position_option_quote?.asof_price
+      summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
       summaryParts.push(`contracts=${trade.contracts_remaining}/${trade.contracts_total}`)
       summaryParts.push(`direction=${trade.direction}`)
       summaryParts.push(`option=${trade.option.right} ${trade.option.expiration} ${trade.option.strike}`)

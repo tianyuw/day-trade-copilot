@@ -266,11 +266,18 @@ class AlpacaClient:
             r.raise_for_status()
             return r.json()
 
-    async def get_option_chain_snapshots(self, underlying_or_symbols: str, feed: str | None = None) -> dict:
+    async def get_option_chain_snapshots(
+        self,
+        underlying_or_symbols: str,
+        feed: str | None = None,
+        page_token: str | None = None,
+    ) -> dict:
         q_feed = (feed or self._settings.alpaca_options_feed or "").strip().lower() or "indicative"
         if q_feed not in {"indicative", "opra"}:
             q_feed = "indicative"
         params = {"feed": q_feed}
+        if page_token:
+            params["page_token"] = page_token
         target = str(underlying_or_symbols).strip().upper()
         url = f"{self._settings.alpaca_options_data_base_url}/options/snapshots/{target}"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -358,6 +365,32 @@ class AlpacaClient:
                 page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
                 if not page_token:
                     break
+        return out
+
+    async def get_option_latest_quotes(self, symbols: list[str], feed: str | None = None) -> dict:
+        symbols_norm = [s.strip().upper() for s in symbols if s.strip()]
+        if not symbols_norm:
+            return {}
+
+        q_feed = (feed or self._settings.alpaca_options_feed or "").strip().lower() or "indicative"
+        if q_feed not in {"indicative", "opra"}:
+            q_feed = "indicative"
+
+        url = f"{self._settings.alpaca_options_data_base_url}/options/quotes/latest"
+        out: dict[str, dict] = {}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for i in range(0, len(symbols_norm), 100):
+                chunk = symbols_norm[i : i + 100]
+                params: dict[str, str] = {"symbols": ",".join(chunk), "feed": q_feed}
+                r = await client.get(url, headers=self._headers, params=params)
+                r.raise_for_status()
+                payload = r.json()
+                quotes = payload.get("quotes") if isinstance(payload, dict) else None
+                if not isinstance(quotes, dict):
+                    continue
+                for sym, q in quotes.items():
+                    if isinstance(q, dict):
+                        out[str(sym).upper()] = q
         return out
 
     async def get_option_trades(

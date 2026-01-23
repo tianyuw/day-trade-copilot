@@ -19,12 +19,15 @@ from .schemas import (
     StreamDoneMessage,
     StreamInitMessage,
     StreamAnalysisMessage,
+    StreamPositionMessage,
+    StreamStateMessage,
     LLMAnalysisRequest,
     LLMAnalysisResponse,
     PositionManagementRequest,
     PositionManagementResponse,
     TradingSettings,
 )
+from .trade_session import SymbolSession, TradeState, _to_epoch_seconds
 from .trading_schemas import (
     CancelOrderRequest,
     ClosePositionRequest,
@@ -168,7 +171,7 @@ def create_app() -> FastAPI:
                     {
                         "trade_id": trade_id,
                         "symbol": str(payload.get("symbol") or request.symbol).upper(),
-                        "mode": "realtime",
+                        "mode": str(getattr(request, "mode", "realtime") or "realtime"),
                         "execution": "paper" if paper_auto_trade_enabled else "simulated",
                         "option_symbol": None,
                         "option_right": plan.get("option", {}).get("right") if isinstance(plan.get("option"), dict) else None,
@@ -187,10 +190,32 @@ def create_app() -> FastAPI:
                     bar_time=str(payload.get("timestamp") or request.current_time),
                     payload=payload,
                 )
+            _append_analysis_history(response)
             return response
         except Exception as e:
             print(f"Analysis Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    analysis_history: dict[str, list[LLMAnalysisResponse]] = {}
+    position_history: dict[str, list[PositionManagementResponse]] = {}
+
+    def _append_analysis_history(res: LLMAnalysisResponse) -> None:
+        sym = str(res.symbol or "").upper()
+        if not sym:
+            return
+        lst = analysis_history.setdefault(sym, [])
+        lst.append(res)
+        if len(lst) > 200:
+            del lst[:-200]
+
+    def _append_position_history(res: PositionManagementResponse) -> None:
+        sym = str(res.symbol or "").upper()
+        if not sym:
+            return
+        lst = position_history.setdefault(sym, [])
+        lst.append(res)
+        if len(lst) > 200:
+            del lst[:-200]
 
     @app.get("/api/analysis/{analysis_id}", response_model=LLMAnalysisResponse)
     async def get_analysis(analysis_id: str) -> LLMAnalysisResponse:
@@ -260,6 +285,17 @@ def create_app() -> FastAPI:
                 prev_close[sym] = float(bars[-1].c)
 
         return {"prev_close": prev_close}
+
+    @app.get("/api/ai/history/{symbol}")
+    async def ai_history(symbol: str) -> dict:
+        sym = symbol.strip().upper()
+        if not sym:
+            raise HTTPException(status_code=400, detail="symbol required")
+        return {
+            "symbol": sym,
+            "analysis": [r.model_dump() for r in analysis_history.get(sym, [])],
+            "positions": [r.model_dump() for r in position_history.get(sym, [])],
+        }
 
     @app.get("/api/options/contracts")
     async def options_contracts(
@@ -397,6 +433,7 @@ def create_app() -> FastAPI:
             payload={"symbol": req.symbol, "execution": "paper" if paper_auto_trade_enabled else "simulated"},
         )
         res = await analysis_service.manage_position(req)
+        _append_position_history(res)
         payload = res.model_dump()
         ledger.append_event(
             trade_id=req.trade_id,
@@ -639,6 +676,34 @@ def create_app() -> FastAPI:
         intraday_buffers: dict[str, list] = {sym: [] for sym in symbol_list}
         daily_bars_df: dict[str, pd.DataFrame | None] = {}
         last_analyzed_time: dict[str, str] = {}
+        sessions: dict[str, SymbolSession] = {sym: SymbolSession(symbol=sym, mode="realtime") for sym in symbol_list}
+        last_state_sent: dict[str, tuple[str, int | None]] = {}
+        llm_sem = asyncio.Semaphore(2)
+
+        async def send_state(sym: str) -> None:
+            s = sessions.get(sym)
+            if not s:
+                return
+            in_pos = bool(s.trade and s.state == TradeState.IN_POSITION and s.trade.contracts_remaining > 0)
+            rem = s.trade.contracts_remaining if s.trade else None
+            key = (s.state.value, rem if isinstance(rem, int) else None)
+            if last_state_sent.get(sym) == key:
+                return
+            last_state_sent[sym] = key
+            await ws.send_json(
+                StreamStateMessage(
+                    type="state",
+                    mode="realtime",
+                    symbol=sym,
+                    state=s.state.value,
+                    in_position=in_pos,
+                    contracts_total=s.trade.contracts_total if s.trade else None,
+                    contracts_remaining=rem,
+                    trade_id=s.trade.trade_id if s.trade else None,
+                    option=s.trade.option if s.trade else None,
+                    option_symbol=s.trade.option_symbol if s.trade else None,
+                ).model_dump()
+            )
         # Fetch daily history for indicators
         today = datetime.now(ZoneInfo("America/New_York")).date()
         daily_start = (today - timedelta(days=60)).isoformat() # Get enough history
@@ -696,6 +761,7 @@ def create_app() -> FastAPI:
                     intraday_buffers[sym].append(bar)
                 
                 await ws.send_json(StreamInitMessage(type="init", mode="realtime", symbol=sym, bars=bars).model_dump())
+                await send_state(sym)
 
             async for sym, bar in alpaca.stream_minute_bars(symbol_list):
                 if sym in indicators:
@@ -713,44 +779,171 @@ def create_app() -> FastAPI:
                     intraday_buffers[sym] = intraday_buffers[sym][-max(analysis_window_minutes + 50, 250):]
                 await ws.send_json(StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump())
 
-                if (
-                    analyze
-                    and bar.indicators
-                    and bar.indicators.get("signal")
-                    and last_analyzed_time.get(sym) != bar.t
-                ):
-                    try:
-                        last_analyzed_time[sym] = bar.t
+                session = sessions.get(sym)
+                if not analyze or not session:
+                    continue
 
+                session.last_bar_time = bar.t
+                now_epoch = _to_epoch_seconds(bar.t)
+                session.update_watches(now_epoch)
+
+                has_quant_signal = bool(bar.indicators and bar.indicators.get("signal"))
+
+                await send_state(sym)
+
+                async def run_analysis() -> None:
+                    async with llm_sem:
+                        session.analysis_inflight = True
+                        session.state = TradeState.AI_VERIFY
+                        await send_state(sym)
                         intraday_slice = intraday_buffers[sym][-analysis_window_minutes:]
                         df_intraday = pd.DataFrame([b.model_dump() for b in intraday_slice])
-                        if not df_intraday.empty:
-                            df_intraday["timestamp"] = pd.to_datetime(df_intraday["t"])
-                            df_intraday.set_index("timestamp", inplace=True)
-                            df_intraday.rename(
-                                columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"},
-                                inplace=True,
-                            )
-                            df_intraday["symbol"] = sym
-                            if "indicators" in df_intraday.columns:
-                                df_intraday.drop(columns=["indicators"], inplace=True)
-                            df_intraday.sort_index(inplace=True)
+                        if df_intraday.empty:
+                            return
+                        df_intraday["timestamp"] = pd.to_datetime(df_intraday["t"])
+                        df_intraday.set_index("timestamp", inplace=True)
+                        df_intraday.rename(
+                            columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"},
+                            inplace=True,
+                        )
+                        df_intraday["symbol"] = sym
+                        if "indicators" in df_intraday.columns:
+                            df_intraday.drop(columns=["indicators"], inplace=True)
+                        df_intraday.sort_index(inplace=True)
+                        analysis_req = LLMAnalysisRequest(symbol=sym, current_time=bar.t, mode="realtime")
+                        llm_res = await analysis_service.analyze_signal(
+                            analysis_req,
+                            preloaded_daily_bars=daily_bars_df.get(sym),
+                            preloaded_intraday_bars=df_intraday,
+                        )
+                        await ws.send_json(
+                            StreamAnalysisMessage(
+                                type="analysis",
+                                mode="realtime",
+                                symbol=sym,
+                                result=llm_res,
+                            ).model_dump()
+                        )
+                        payload = llm_res.model_dump()
+                        session.on_analysis_result(payload)
+                        if payload.get("action") in ("buy_long", "buy_short") and isinstance(payload.get("trade_plan"), dict):
+                            plan = payload.get("trade_plan") or {}
+                            opt = plan.get("option") if isinstance(plan.get("option"), dict) else {}
+                            option_symbol: str | None = None
+                            try:
+                                exp = str(opt.get("expiration") or "")
+                                right = str(opt.get("right") or "").lower()
+                                strike = float(opt.get("strike") or 0.0)
+                                if exp and right and strike:
+                                    contracts = await option_chain_service.get_contracts(
+                                        sym,
+                                        asof_date=None,
+                                        expiration_date_gte=exp,
+                                        expiration_date_lte=exp,
+                                        limit=1000,
+                                    )
+                                    for c in contracts:
+                                        try:
+                                            if str(c.get("type") or "").lower() != right:
+                                                continue
+                                            if str(c.get("expiration_date") or "") != exp:
+                                                continue
+                                            if abs(float(c.get("strike_price") or 0.0) - strike) > 1e-6:
+                                                continue
+                                            s2 = str(c.get("symbol") or "").upper()
+                                            if s2:
+                                                option_symbol = s2
+                                                break
+                                        except Exception:
+                                            continue
+                            except Exception:
+                                option_symbol = None
+                            session.enter_from_trade_plan(payload, option_symbol=option_symbol)
+                        session.analysis_inflight = False
+                        if session.state == TradeState.AI_VERIFY:
+                            session.state = TradeState.SCAN
+                        await send_state(sym)
 
-                            analysis_req = LLMAnalysisRequest(symbol=sym, current_time=bar.t)
-                            llm_res = await analysis_service.analyze_signal(
-                                analysis_req,
-                                preloaded_daily_bars=daily_bars_df.get(sym),
-                                preloaded_intraday_bars=df_intraday,
-                            )
+                async def run_manage() -> None:
+                    if not session.trade:
+                        return
+                    async with llm_sem:
+                        session.manage_inflight = True
+                        req_pm = PositionManagementRequest(
+                            trade_id=session.trade.trade_id,
+                            symbol=sym,
+                            bar_time=bar.t,
+                            position={
+                                "direction": session.trade.direction,
+                                "option": session.trade.option,
+                                "contracts_total": session.trade.contracts_total,
+                                "contracts_remaining": session.trade.contracts_remaining,
+                                "entry": {"time": session.trade.entry_time, "premium": session.trade.entry_premium},
+                                "risk": {
+                                    "stop_loss_premium": session.trade.risk.get("stop_loss_premium"),
+                                    "take_profit_premium": session.trade.risk.get("take_profit_premium"),
+                                    "time_stop_minutes": session.trade.risk.get("time_stop_minutes"),
+                                },
+                            },
+                            option_symbol=session.trade.option_symbol,
+                            ohlcv_1m=None,
+                        )
+                        pm_res = await analysis_service.manage_position(req_pm)
+                        await ws.send_json(
+                            StreamPositionMessage(
+                                type="position",
+                                mode="realtime",
+                                symbol=sym,
+                                result=pm_res,
+                            ).model_dump()
+                        )
+                        session.on_position_decision(pm_res.model_dump())
+                        session.manage_inflight = False
+                        await send_state(sym)
 
-                            await ws.send_json(
-                                StreamAnalysisMessage(
-                                    type="analysis",
-                                    mode="realtime",
-                                    symbol=sym,
-                                    result=llm_res,
-                                ).model_dump()
-                            )
+                if session.trade and session.state == TradeState.IN_POSITION and not session.manage_inflight:
+                    try:
+                        await run_manage()
+                    except Exception as e:
+                        print(f"Auto-PositionManage failed for {sym}: {e}")
+                    continue
+
+                if session.watches and bar.t:
+                    hit = None
+                    try:
+                        close_px = float(bar.c)
+                        for w in sorted(session.watches, key=lambda x: x.created_at_epoch_s):
+                            if w.direction == "above" and close_px >= w.trigger_price:
+                                hit = w
+                                break
+                            if w.direction == "below" and close_px <= w.trigger_price:
+                                hit = w
+                                break
+                    except Exception:
+                        hit = None
+                    if hit and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
+                        session.watches = [w for w in session.watches if w is not hit]
+                        last_analyzed_time[sym] = bar.t
+                        try:
+                            await run_analysis()
+                        except Exception as e:
+                            print(f"Auto-Analysis failed for {sym}: {e}")
+                        continue
+
+                if session.state == TradeState.FOLLOW_UP_PENDING and session.follow_up.armed and bar.t:
+                    if not has_quant_signal and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
+                        session.follow_up = session.follow_up.__class__(armed=False)
+                        last_analyzed_time[sym] = bar.t
+                        try:
+                            await run_analysis()
+                        except Exception as e:
+                            print(f"Auto-Analysis failed for {sym}: {e}")
+                        continue
+
+                if has_quant_signal and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
+                    last_analyzed_time[sym] = bar.t
+                    try:
+                        await run_analysis()
                     except Exception as e:
                         print(f"Auto-Analysis failed for {sym}: {e}")
         except WebSocketDisconnect:
@@ -777,7 +970,9 @@ def create_app() -> FastAPI:
     ) -> None:
         await ws.accept()
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        sessions: dict[str, SymbolSession] = {sym: SymbolSession(symbol=sym, mode="playback") for sym in symbol_list}
         try:
+            warmup_minutes = 200 + 21
             warmup_minutes = 200 + 21
             base_cursor = 0
             request_start = start
@@ -867,6 +1062,17 @@ def create_app() -> FastAPI:
                 await ws.send_json(
                     StreamInitMessage(type="init", mode="playback", symbol=sym, bars=init, cursor=end).model_dump()
                 )
+                s = sessions.get(sym)
+                if s:
+                    await ws.send_json(
+                        StreamStateMessage(
+                            type="state",
+                            mode="playback",
+                            symbol=sym,
+                            state=s.state.value,
+                            in_position=False,
+                        ).model_dump()
+                    )
 
             i = safe_cursor
             while True:
@@ -904,23 +1110,18 @@ def create_app() -> FastAPI:
                                     df_intraday = None
                                 
                                 if df_intraday is not None:
-                                    analysis_req = LLMAnalysisRequest(
-                                        symbol=sym,
-                                        current_time=bar.t
-                                    )
-                                    
+                                    analysis_req = LLMAnalysisRequest(symbol=sym, current_time=bar.t, mode="playback")
                                     llm_res = await analysis_service.analyze_signal(
                                         analysis_req,
                                         preloaded_daily_bars=df_daily,
-                                        preloaded_intraday_bars=df_intraday
+                                        preloaded_intraday_bars=df_intraday,
                                     )
-                                    
                                     await ws.send_json(
                                         StreamAnalysisMessage(
-                                            type="analysis", 
-                                            mode="playback", 
-                                            symbol=sym, 
-                                            result=llm_res
+                                            type="analysis",
+                                            mode="playback",
+                                            symbol=sym,
+                                            result=llm_res,
                                         ).model_dump()
                                     )
                                 

@@ -463,11 +463,17 @@ Recent Price Action (Last 60 mins):
             strikes_around_atm = 5
 
         try:
-            chain = await self.option_chain_service.build_chain(
-                underlying=symbol,
-                asof=request.current_time,
-                strikes_around_atm=strikes_around_atm,
-            )
+            if getattr(request, "mode", "realtime") == "realtime":
+                chain = await self.option_chain_service.get_chain_realtime(
+                    underlying=symbol,
+                    strikes_around_atm=strikes_around_atm,
+                )
+            else:
+                chain = await self.option_chain_service.get_chain_asof(
+                    underlying=symbol,
+                    asof=request.current_time,
+                    strikes_around_atm=strikes_around_atm,
+                )
             exp = chain.get("expiration") if isinstance(chain, dict) else None
             underlying_px = chain.get("underlying_price") if isinstance(chain, dict) else None
             items = chain.get("items") if isinstance(chain, dict) else None
@@ -488,7 +494,13 @@ Recent Price Action (Last 60 mins):
                     right = it.get("right")
                     strike = it.get("strike")
                     opt_sym = it.get("symbol")
-                    context_text += f"- {opt_sym} {right} {strike}: bid={bid}, ask={ask}\n"
+                    asof_px = it.get("asof_price")
+                    if asof_px is None and bid is not None and ask is not None:
+                        try:
+                            asof_px = (float(bid) + float(ask)) / 2.0
+                        except Exception:
+                            asof_px = None
+                    context_text += f"- {opt_sym} {right} {strike}: last≈{asof_px}, bid={bid}, ask={ask}\n"
         except Exception:
             pass
 
@@ -704,20 +716,109 @@ Recent Price Action (Last 60 mins):
             t_str = b["t"].strftime("%H:%M")
             context_text += f"- {t_str}: O={b['o']:.2f}, H={b['h']:.2f}, L={b['l']:.2f}, C={b['c']:.2f}, V={b['v']}\n"
 
-        context_text += "\nPosition Context:\n"
-        context_text += json.dumps(req.position.model_dump(), ensure_ascii=False) + "\n"
+        position_option_quote: dict | None = None
+        try:
+            pos_opt = req.position.option
+        except Exception:
+            pos_opt = None  # type: ignore[assignment]
 
-        if req.option_symbol:
+        try:
             try:
+                strikes_around_atm_opt = int(os.getenv("OPTION_CHAIN_STRIKES_AROUND_ATM", "10"))
+            except Exception:
+                strikes_around_atm_opt = 10
+
+            if getattr(req, "mode", "realtime") == "realtime":
+                chain_opt = await self.option_chain_service.get_chain_realtime(
+                    underlying=symbol,
+                    strikes_around_atm=strikes_around_atm_opt,
+                )
+            else:
+                chain_opt = await self.option_chain_service.get_chain_asof(
+                    underlying=symbol,
+                    asof=req.bar_time,
+                    strikes_around_atm=strikes_around_atm_opt,
+                    include_bars_minutes=0,
+                )
+            items_opt = chain_opt.get("items") if isinstance(chain_opt, dict) else None
+            target = None
+            opt_sym = (req.option_symbol or "").strip().upper() or None
+            if isinstance(items_opt, list):
+                if opt_sym:
+                    for it in items_opt:
+                        if isinstance(it, dict) and str(it.get("symbol") or "").upper() == opt_sym:
+                            target = it
+                            break
+                if target is None and pos_opt is not None:
+                    for it in items_opt:
+                        if not isinstance(it, dict):
+                            continue
+                        try:
+                            if (
+                                str(it.get("expiration") or "") == getattr(pos_opt, "expiration", "")
+                                and str(it.get("right") or "") == getattr(pos_opt, "right", "")
+                                and float(it.get("strike")) == float(getattr(pos_opt, "strike", 0.0))
+                            ):
+                                target = it
+                                break
+                        except Exception:
+                            continue
+
+            if target is not None:
+                q = target.get("quote") if isinstance(target.get("quote"), dict) else {}
+                bid = q.get("bid")
+                ask = q.get("ask")
+                asof_px = target.get("asof_price")
+                exp = target.get("expiration")
+                strike = target.get("strike")
+                right = target.get("right")
+                sym = target.get("symbol") or opt_sym or ""
+                if asof_px is None and bid is not None and ask is not None:
+                    try:
+                        asof_px = (float(bid) + float(ask)) / 2.0
+                    except Exception:
+                        asof_px = None
+                position_option_quote = {
+                    "symbol": sym,
+                    "right": right,
+                    "strike": strike,
+                    "expiration": exp,
+                    "asof": req.bar_time,
+                    "asof_price": asof_px,
+                    "bid": bid,
+                    "ask": ask,
+                }
+                context_text += (
+                    f"\nPosition Option Quote (as of {req.bar_time}):\n"
+                    f"- {sym} {right} {strike} exp={exp}: last≈{asof_px}, bid={bid}, ask={ask}\n"
+                )
+            elif opt_sym:
                 end_iso = current_dt.isoformat().replace("+00:00", "Z")
                 start_iso = (current_dt - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
-                quotes = await self.alpaca.get_option_quotes([req.option_symbol], start=start_iso, end=end_iso, limit=1000)
-                rows = quotes.get(req.option_symbol, []) if isinstance(quotes, dict) else []
+                quotes = await self.alpaca.get_option_quotes([opt_sym], start=start_iso, end=end_iso, limit=1000)
+                rows = quotes.get(opt_sym, []) if isinstance(quotes, dict) else []
                 last = rows[-1] if rows else None
                 if isinstance(last, dict):
-                    context_text += f"Option Quote:\n- {req.option_symbol}: bid={last.get('bp')}, ask={last.get('ap')}, t={last.get('t')}\n"
-            except Exception:
-                pass
+                    try:
+                        bp = last.get("bp")
+                        ap = last.get("ap")
+                        mid = (float(bp) + float(ap)) / 2.0 if bp is not None and ap is not None else None
+                    except Exception:
+                        mid = None
+                    position_option_quote = {
+                        "symbol": opt_sym,
+                        "asof": req.bar_time,
+                        "asof_price": mid,
+                        "bid": last.get("bp"),
+                        "ask": last.get("ap"),
+                        "t": last.get("t"),
+                    }
+                    context_text += (
+                        f"\nPosition Option Quote (as of {req.bar_time}):\n"
+                        f"- {opt_sym}: bid={last.get('bp')}, ask={last.get('ap')}, t={last.get('t')}\n"
+                    )
+        except Exception:
+            pass
 
         context_text += "\nBenchmark Context (Proxy Futures):\n"
         benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
@@ -760,4 +861,10 @@ Recent Price Action (Last 60 mins):
             else:
                 context_text += "    - N/A\n"
 
-        return await self.llm_client.manage_position(req, chart_base64, context_text)
+        resp = await self.llm_client.manage_position(req, chart_base64, context_text)
+        if position_option_quote:
+            try:
+                resp = resp.model_copy(update={"position_option_quote": position_option_quote})
+            except Exception:
+                pass
+        return resp

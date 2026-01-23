@@ -45,12 +45,33 @@ class StreamAnalysisMessage(BaseModel):
     result: LLMAnalysisResponse
 
 
+class StreamStateMessage(BaseModel):
+    type: Literal["state"]
+    mode: Literal["realtime", "playback"]
+    symbol: str
+    state: str
+    in_position: bool
+    contracts_total: int | None = None
+    contracts_remaining: int | None = None
+    trade_id: str | None = None
+    option: dict[str, Any] | None = None
+    option_symbol: str | None = None
+
+
+class StreamPositionMessage(BaseModel):
+    type: Literal["position"]
+    mode: Literal["realtime", "playback"]
+    symbol: str
+    result: "PositionManagementResponse"
+
+
 
 # --- LLM Analysis Schemas ---
 
 class LLMAnalysisRequest(BaseModel):
     symbol: str
     current_time: str  # ISO8601 string, the time of the bar that triggered the analysis
+    mode: Literal["realtime", "playback"] = "realtime"
 
 class WatchCondition(BaseModel):
     trigger_price: float
@@ -191,6 +212,7 @@ class PositionManagementRequest(BaseModel):
     position: PositionState
     ohlcv_1m: list[dict[str, Any]] | None = None
     option_symbol: str | None = None
+    mode: Literal["realtime", "playback"] = "realtime"
 
 
 class PositionManagementResponse(BaseModel):
@@ -200,3 +222,4 @@ class PositionManagementResponse(BaseModel):
     symbol: str
     bar_time: str
     decision: PositionDecision
+    position_option_quote: dict[str, Any] | None = None

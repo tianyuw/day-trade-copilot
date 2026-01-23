@@ -2,6 +2,7 @@
 
 import Link from "next/link"
 import { useEffect, useMemo, useRef, useState } from "react"
+import { motion } from "framer-motion"
 import { TrackingMiniChart } from "../../components/TrackingMiniChart"
 import { cn } from "../../components/cn"
 
@@ -16,7 +17,20 @@ type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; b
 type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
 type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
 type StreamError = { type: "error"; message: string }
-type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamDone | StreamError
+type StreamState = {
+  type: "state"
+  mode: "realtime" | "playback"
+  symbol: string
+  state: string
+  in_position: boolean
+  contracts_total?: number | null
+  contracts_remaining?: number | null
+  trade_id?: string | null
+  option?: { right: "call" | "put"; expiration: string; strike: number } | null
+  option_symbol?: string | null
+}
+type StreamPosition = { type: "position"; mode: "realtime" | "playback"; symbol: string; result: any }
+type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamState | StreamPosition | StreamDone | StreamError
 
 type MarketStatus = {
   server_time: string
@@ -82,6 +96,17 @@ export default function TrackingPage() {
   const [isEditing, setIsEditing] = useState(false)
   const [barsBySymbol, setBarsBySymbol] = useState<Record<string, any[]>>({})
   const [analysisBySymbol, setAnalysisBySymbol] = useState<Record<string, AnalysisResult | null>>({})
+  const [sessionBySymbol, setSessionBySymbol] = useState<
+    Record<
+      string,
+      {
+        state: string
+        inPosition: boolean
+        contractsRemaining: number | null
+        contractsTotal: number | null
+      }
+    >
+  >({})
   const [prevCloseBySymbol, setPrevCloseBySymbol] = useState<Record<string, number | null>>({})
   const [market, setMarket] = useState<MarketStatus | null>(null)
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("closed")
@@ -249,6 +274,16 @@ export default function TrackingPage() {
         const res = msg.result as AnalysisResult
         setAnalysisBySymbol((prev) => ({ ...prev, [msg.symbol]: res }))
         if (res?.analysis_id) saveAnalysis(res)
+      } else if (msg.type === "state") {
+        setSessionBySymbol((prev) => ({
+          ...prev,
+          [msg.symbol]: {
+            state: msg.state,
+            inPosition: msg.in_position,
+            contractsRemaining: msg.contracts_remaining ?? null,
+            contractsTotal: msg.contracts_total ?? null,
+          },
+        }))
       }
     }
 
@@ -259,19 +294,15 @@ export default function TrackingPage() {
   }, [symbolsParam, watchlist.length])
 
   const sortedSymbols = useMemo(() => {
-    const hot: Array<{ sym: string; score: number }> = []
-    const cold: string[] = []
+    const inPos: string[] = []
+    const rest: string[] = []
     for (const sym of watchlist) {
-      const a = analysisBySymbol[sym]
-      if (a && (a.action === "buy_long" || a.action === "buy_short")) {
-        hot.push({ sym, score: a.confidence ?? 0 })
-      } else {
-        cold.push(sym)
-      }
+      const sess = sessionBySymbol[sym]
+      if (sess?.inPosition && (sess.contractsRemaining ?? 0) > 0) inPos.push(sym)
+      else rest.push(sym)
     }
-    hot.sort((x, y) => y.score - x.score)
-    return [...hot.map((x) => x.sym), ...cold]
-  }, [analysisBySymbol, watchlist])
+    return [...inPos, ...rest]
+  }, [sessionBySymbol, watchlist])
 
   const countdown = useMemo(() => {
     if (!market) return null
@@ -361,17 +392,22 @@ export default function TrackingPage() {
                   ? ((price - prevClose) / prevClose) * 100
                   : null
               const a = analysisBySymbol[sym]
+              const sess = sessionBySymbol[sym]
+              const inPosition = sess?.inPosition && (sess.contractsRemaining ?? 0) > 0
               const hasSignal = a && (a.action === "buy_long" || a.action === "buy_short")
               const border =
-                hasSignal && a?.action === "buy_long"
-                  ? "ring-2 ring-emerald-500/60 shadow-[0_0_18px_rgba(34,197,94,0.35)]"
-                  : hasSignal && a?.action === "buy_short"
-                    ? "ring-2 ring-red-500/60 shadow-[0_0_18px_rgba(239,68,68,0.35)]"
-                    : "ring-1 ring-white/10"
+                inPosition && sess?.state === "IN_POSITION"
+                  ? "border-emerald-400/70 ring-2 ring-emerald-400/70 shadow-[0_0_24px_rgba(34,197,94,0.55)]"
+                  : hasSignal && a?.action === "buy_long"
+                    ? "border-emerald-500/50 ring-2 ring-emerald-500/55 shadow-[0_0_18px_rgba(34,197,94,0.35)]"
+                    : hasSignal && a?.action === "buy_short"
+                      ? "border-red-500/50 ring-2 ring-red-500/55 shadow-[0_0_18px_rgba(239,68,68,0.35)]"
+                      : ""
 
               const href = a?.analysis_id ? `/tracking/${sym}?analysis_id=${encodeURIComponent(a.analysis_id)}` : `/tracking/${sym}`
 
               return (
+                <motion.div layout key={sym}>
                 <Link
                   key={sym}
                   href={href}
@@ -405,7 +441,8 @@ export default function TrackingPage() {
                     }
                   }}
                   className={cn(
-                    "group relative overflow-hidden rounded-2xl bg-black/35 backdrop-blur-md p-4 transition hover:bg-black/45",
+                    "block h-full group relative overflow-hidden rounded-2xl border border-white/10 p-4 transition hover:border-white/20 hover:bg-black/45 bg-black/40",
+                    inPosition ? "animate-[bgPulse_2.4s_ease_infinite]" : "",
                     border,
                   )}
                 >
@@ -423,7 +460,6 @@ export default function TrackingPage() {
                       ×
                     </button>
                   )}
-                  <div className="absolute inset-0 bg-neon-radial opacity-60" />
                   <div className="relative">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
@@ -468,6 +504,7 @@ export default function TrackingPage() {
                     </div>
                   </div>
                 </Link>
+                </motion.div>
               )
             })}
 

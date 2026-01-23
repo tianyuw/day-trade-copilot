@@ -8,6 +8,7 @@ from .schemas import (
 )
 from .google_api_client import GoogleAPIClient
 from .llm_prompts import get_llm_system_prompt
+from .debug_logging import LLMExchangeMeta, Stopwatch, write_llm_exchange
 
 class LLMClient:
     def __init__(self):
@@ -47,7 +48,11 @@ The attached chart contains three panels:
 Based on the chart and context, provide your trading decision JSON.
 """
 
+        content: str | None = None
+        data: dict | None = None
+        sw: Stopwatch | None = None
         try:
+            sw = Stopwatch()
             content = await self.client.analyze_chart(
                 system_prompt=system_prompt,
                 user_content_text=user_content_text,
@@ -55,7 +60,8 @@ Based on the chart and context, provide your trading decision JSON.
             )
             
             # Parse JSON and validate with Pydantic
-            data = json.loads(content)
+            parsed = json.loads(content)
+            data = parsed
             if isinstance(data, list):
                 if len(data) == 1 and isinstance(data[0], dict):
                     data = data[0]
@@ -64,21 +70,54 @@ Based on the chart and context, provide your trading decision JSON.
             
             # Ensure required fields that might be missing from LLM are present or set defaults
             import uuid
-            data["analysis_id"] = str(uuid.uuid4())
+            analysis_id = str(uuid.uuid4())
+            data["analysis_id"] = analysis_id
             
             if "timestamp" not in data:
                 data["timestamp"] = request.current_time
             if "symbol" not in data:
                 data["symbol"] = request.symbol
-                
+            
+            write_llm_exchange(
+                meta=LLMExchangeMeta(
+                    kind="analysis",
+                    model=getattr(self.client, "model_name", None),
+                    symbol=request.symbol,
+                    analysis_id=analysis_id,
+                    current_time=request.current_time,
+                ),
+                system_prompt=system_prompt,
+                user_prompt=user_content_text,
+                response_raw=content,
+                parsed_json=data if isinstance(data, dict) else None,
+                error=None,
+                duration_ms=sw.elapsed_ms() if sw else None,
+            )
+
             return LLMAnalysisResponse(**data)
             
         except Exception as e:
             print(f"LLM Error: {e}")
             # Fallback response
             import uuid
+            analysis_id = str(uuid.uuid4())
+            write_llm_exchange(
+                meta=LLMExchangeMeta(
+                    kind="analysis",
+                    model=getattr(self.client, "model_name", None),
+                    symbol=request.symbol,
+                    analysis_id=analysis_id,
+                    current_time=request.current_time,
+                ),
+                system_prompt=system_prompt,
+                user_prompt=user_content_text,
+                response_raw=content,
+                parsed_json=data if isinstance(data, dict) else None,
+                error=str(e),
+                duration_ms=sw.elapsed_ms() if sw else None,
+            )
             return LLMAnalysisResponse(
-                analysis_id=str(uuid.uuid4()),
+                analysis_id=analysis_id,
                 timestamp=request.current_time,
                 symbol=request.symbol,
                 action="ignore",
@@ -116,6 +155,17 @@ Based on the chart and context, provide your trading decision JSON.
             "- tighten_stop/adjust_take_profit/update_time_stop must specify the corresponding new_* field.\n"
         )
 
+        marker = "\nPosition Option Quote (as of"
+        bench_marker = "\nBenchmark Context (Proxy Futures):\n"
+        opt_block = ""
+        start_idx = context_text.find(marker)
+        if start_idx != -1:
+            end_idx = context_text.find(bench_marker, start_idx)
+            if end_idx == -1:
+                end_idx = len(context_text)
+            opt_block = context_text[start_idx:end_idx]
+            context_text = context_text[:start_idx] + context_text[end_idx:]
+
         user_content_text = f"""Manage the current position for {request.symbol} at {request.bar_time}.
 
 Market Context:
@@ -136,20 +186,30 @@ The attached chart contains three panels:
 Position Context (JSON):
 {json.dumps(request.position.model_dump(), ensure_ascii=False)}
 
-Option Symbol:
-{request.option_symbol or ""}
+"""
 
+        if opt_block:
+            opt_block_renamed = opt_block.replace("Position Option Quote", "Position Latest Option Quote", 1)
+            user_content_text += f"""
+{opt_block_renamed}
+"""
+        user_content_text += """
 Based on the chart and context, provide your position management decision JSON.
 """
 
+        content: str | None = None
+        data: dict | None = None
+        sw: Stopwatch | None = None
         try:
+            sw = Stopwatch()
             content = await self.client.analyze_chart(
                 system_prompt=system_prompt,
                 user_content_text=user_content_text,
                 chart_image_base64=chart_image_base64,
             )
 
-            data = json.loads(content)
+            parsed = json.loads(content)
+            data = parsed
             if isinstance(data, list):
                 if len(data) == 1 and isinstance(data[0], dict):
                     data = data[0]
@@ -158,7 +218,8 @@ Based on the chart and context, provide your position management decision JSON.
 
             import uuid
 
-            data["analysis_id"] = str(uuid.uuid4())
+            analysis_id = str(uuid.uuid4())
+            data["analysis_id"] = analysis_id
             if "timestamp" not in data:
                 data["timestamp"] = request.bar_time
             if "symbol" not in data:
@@ -168,13 +229,46 @@ Based on the chart and context, provide your position management decision JSON.
             if "bar_time" not in data:
                 data["bar_time"] = request.bar_time
 
+            write_llm_exchange(
+                meta=LLMExchangeMeta(
+                    kind="position_management",
+                    model=getattr(self.client, "model_name", None),
+                    symbol=request.symbol,
+                    analysis_id=analysis_id,
+                    trade_id=request.trade_id,
+                    bar_time=request.bar_time,
+                ),
+                system_prompt=system_prompt,
+                user_prompt=user_content_text,
+                response_raw=content,
+                parsed_json=data if isinstance(data, dict) else None,
+                error=None,
+                duration_ms=sw.elapsed_ms() if sw else None,
+            )
             return PositionManagementResponse(**data)
         except Exception as e:
             import uuid
 
+            analysis_id = str(uuid.uuid4())
+            write_llm_exchange(
+                meta=LLMExchangeMeta(
+                    kind="position_management",
+                    model=getattr(self.client, "model_name", None),
+                    symbol=request.symbol,
+                    analysis_id=analysis_id,
+                    trade_id=request.trade_id,
+                    bar_time=request.bar_time,
+                ),
+                system_prompt=system_prompt,
+                user_prompt=user_content_text,
+                response_raw=content,
+                parsed_json=data if isinstance(data, dict) else None,
+                error=str(e),
+                duration_ms=sw.elapsed_ms() if sw else None,
+            )
             return PositionManagementResponse(
                 trade_id=request.trade_id,
-                analysis_id=str(uuid.uuid4()),
+                analysis_id=analysis_id,
                 timestamp=request.bar_time,
                 symbol=request.symbol,
                 bar_time=request.bar_time,

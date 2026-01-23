@@ -7,18 +7,25 @@ import { CandleCard } from "../../../components/CandleCard"
 import { AICopilot, type ChatMessage } from "../../../components/AICopilot"
 import { cn } from "../../../components/cn"
 
-type StreamInit = {
-  type: "init"
-  mode: "realtime" | "playback"
-  symbol: string
-  bars: any[]
-  cursor?: number
-}
+type StreamInit = { type: "init"; mode: "realtime" | "playback"; symbol: string; bars: any[]; cursor?: number }
 type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; bar: any; i?: number }
 type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
+type StreamState = {
+  type: "state"
+  mode: "realtime" | "playback"
+  symbol: string
+  state: string
+  in_position: boolean
+  contracts_total?: number | null
+  contracts_remaining?: number | null
+  trade_id?: string | null
+  option?: { right: "call" | "put"; expiration: string; strike: number } | null
+  option_symbol?: string | null
+}
+type StreamPosition = { type: "position"; mode: "realtime" | "playback"; symbol: string; result: any }
 type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
 type StreamError = { type: "error"; message: string }
-type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamDone | StreamError
+type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamState | StreamPosition | StreamDone | StreamError
 
 type AnalysisResult = {
   analysis_id: string
@@ -97,6 +104,12 @@ export default function TrackingDetailPage() {
   const [lastDaily, setLastDaily] = useState<DailyBar | null>(null)
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("closed")
   const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
+  const [sessionState, setSessionState] = useState<{
+    state: string
+    inPosition: boolean
+    contractsRemaining: number | null
+    contractsTotal: number | null
+  } | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
@@ -160,6 +173,39 @@ export default function TrackingDetailPage() {
   }, [symbol])
 
   useEffect(() => {
+    async function hydrateHistory() {
+      try {
+        const res = await fetch(`${baseHttp}/api/ai/history/${encodeURIComponent(symbol)}`)
+        if (!res.ok) return
+        const data = await res.json()
+        const analysis: any[] = Array.isArray(data?.analysis) ? data.analysis : []
+        const positions: any[] = Array.isArray(data?.positions) ? data.positions : []
+        const items: Array<{ ts: string; kind: "analysis" | "position"; payload: any }> = []
+        for (const a of analysis) {
+          if (a && typeof a === "object") items.push({ ts: String(a.timestamp ?? ""), kind: "analysis", payload: a })
+        }
+        for (const p of positions) {
+          if (p && typeof p === "object") items.push({ ts: String(p.timestamp ?? p.bar_time ?? ""), kind: "position", payload: p })
+        }
+        items.sort((x, y) => Date.parse(x.ts) - Date.parse(y.ts))
+
+        setAiMessages((prev) => {
+          const base = prev.slice(0, 1)
+          const mapped = items.map((it) => {
+            if (it.kind === "analysis") {
+              return { role: "ai" as const, content: it.payload, time: formatPSTFromRFC3339(it.ts), type: "analysis" as const }
+            }
+            const d = it.payload?.decision
+            const summaryParts = [`POSITION_MGMT: ${d?.action ?? "hold"}`, String(d?.reasoning ?? "")].filter(Boolean)
+            const optPx = it.payload?.position_option_quote?.asof_price
+            summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
+            return { role: "ai" as const, content: summaryParts.join("\n"), time: formatPSTFromRFC3339(it.ts) }
+          })
+          return [...base, ...mapped]
+        })
+      } catch {}
+    }
+
     async function hydrateFromId(id: string) {
       const local = loadAnalysis(id)
       if (local) {
@@ -178,10 +224,13 @@ export default function TrackingDetailPage() {
           ...prev,
           { role: "ai", content: data, time: formatPSTFromRFC3339(data.timestamp), type: "analysis" },
         ])
-      } catch (e) {}
+      } catch {}
     }
+
+    if (!symbol) return
+    hydrateHistory()
     if (analysisId) hydrateFromId(analysisId)
-  }, [analysisId, baseHttp])
+  }, [analysisId, baseHttp, symbol])
 
   useEffect(() => {
     async function fetchMarket() {
@@ -309,6 +358,38 @@ export default function TrackingDetailPage() {
           setAiMessages((prev) => [
             ...prev,
             { role: "ai", content: res, time: formatPSTFromRFC3339(res?.timestamp ?? new Date().toISOString()), type: "analysis" },
+          ])
+        }
+      } else if (msg.type === "state") {
+        if (msg.symbol === symbol) {
+          setSessionState({
+            state: msg.state,
+            inPosition: msg.in_position,
+            contractsRemaining: msg.contracts_remaining ?? null,
+            contractsTotal: msg.contracts_total ?? null,
+          })
+        }
+      } else if (msg.type === "position") {
+        if (msg.symbol === symbol) {
+          const res = msg.result as any
+          const d = res.decision
+          const last = bars.length ? bars[bars.length - 1] : null
+          const lastPx = typeof last?.c === "number" ? last.c : null
+          const summaryParts = [`POSITION_MGMT: ${d.action}`, d.reasoning]
+          summaryParts.push(`last_px=${lastPx ?? "N/A"}`)
+          const optPx = res?.position_option_quote?.asof_price
+          summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
+          if (d.exit?.contracts_to_close) summaryParts.push(`contracts_to_close=${d.exit.contracts_to_close}`)
+          if (d.adjustments?.new_stop_loss_premium != null) summaryParts.push(`new_stop=${d.adjustments.new_stop_loss_premium}`)
+          if (d.adjustments?.new_take_profit_premium != null) summaryParts.push(`new_tp=${d.adjustments.new_take_profit_premium}`)
+          if (d.adjustments?.new_time_stop_minutes != null) summaryParts.push(`new_time_stop=${d.adjustments.new_time_stop_minutes}`)
+          setAiMessages((prev) => [
+            ...prev,
+            {
+              role: "ai",
+              content: summaryParts.join("\n"),
+              time: formatPSTFromRFC3339(res?.timestamp ?? res?.bar_time ?? new Date().toISOString()),
+            },
           ])
         }
       }
