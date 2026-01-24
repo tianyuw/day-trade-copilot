@@ -39,6 +39,7 @@ class Ledger:
                   symbol TEXT NOT NULL,
                   mode TEXT NOT NULL,
                   execution TEXT NOT NULL,
+                  state TEXT,
                   option_symbol TEXT,
                   option_right TEXT,
                   option_expiration TEXT,
@@ -61,6 +62,7 @@ class Ledger:
                 CREATE TABLE IF NOT EXISTS trade_events (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   trade_id TEXT NOT NULL,
+                  symbol TEXT,
                   timestamp TEXT NOT NULL,
                   event_type TEXT NOT NULL,
                   analysis_id TEXT,
@@ -72,12 +74,25 @@ class Ledger:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_trade_id ON trade_events(trade_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_ts ON trade_events(timestamp)")
 
+            def has_column(table: str, col: str) -> bool:
+                rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                return any(str(r["name"]) == col for r in rows)
+
+            if not has_column("trades", "state"):
+                conn.execute("ALTER TABLE trades ADD COLUMN state TEXT")
+            if not has_column("trade_events", "symbol"):
+                conn.execute("ALTER TABLE trade_events ADD COLUMN symbol TEXT")
+
+            if has_column("trade_events", "symbol"):
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_symbol_ts ON trade_events(symbol, timestamp)")
+
     def upsert_trade(self, trade: dict[str, Any]) -> None:
         now = _utc_now_iso()
         trade_id = str(trade.get("trade_id") or "").strip()
         symbol = str(trade.get("symbol") or "").strip().upper()
         mode = str(trade.get("mode") or "realtime").strip().lower()
         execution = str(trade.get("execution") or "paper").strip().lower()
+        state = str(trade.get("state") or "").strip().upper() or None
         if not trade_id or not symbol:
             raise ValueError("trade_id and symbol are required")
 
@@ -91,13 +106,13 @@ class Ledger:
             conn.execute(
                 """
                 INSERT INTO trades (
-                  trade_id, symbol, mode, execution,
+                  trade_id, symbol, mode, execution, state,
                   option_symbol, option_right, option_expiration, option_strike,
                   contracts_total, contracts_remaining,
                   entry_time, entry_premium, exit_time, exit_premium, pnl_option_usd,
                   extra_json, created_at, updated_at
                 ) VALUES (
-                  :trade_id, :symbol, :mode, :execution,
+                  :trade_id, :symbol, :mode, :execution, :state,
                   :option_symbol, :option_right, :option_expiration, :option_strike,
                   :contracts_total, :contracts_remaining,
                   :entry_time, :entry_premium, :exit_time, :exit_premium, :pnl_option_usd,
@@ -107,6 +122,7 @@ class Ledger:
                   symbol=excluded.symbol,
                   mode=excluded.mode,
                   execution=excluded.execution,
+                  state=COALESCE(excluded.state, trades.state),
                   option_symbol=COALESCE(excluded.option_symbol, trades.option_symbol),
                   option_right=COALESCE(excluded.option_right, trades.option_right),
                   option_expiration=COALESCE(excluded.option_expiration, trades.option_expiration),
@@ -126,6 +142,7 @@ class Ledger:
                     "symbol": symbol,
                     "mode": mode,
                     "execution": execution,
+                    "state": state,
                     "option_symbol": trade.get("option_symbol"),
                     "option_right": trade.get("option_right"),
                     "option_expiration": trade.get("option_expiration"),
@@ -147,6 +164,7 @@ class Ledger:
         self,
         trade_id: str,
         event_type: str,
+        symbol: str | None = None,
         timestamp: str | None = None,
         analysis_id: str | None = None,
         bar_time: str | None = None,
@@ -157,14 +175,15 @@ class Ledger:
         if not trade_id or not event_type:
             raise ValueError("trade_id and event_type are required")
         ts = timestamp or _utc_now_iso()
+        sym = str(symbol or "").strip().upper() or None
         payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO trade_events (trade_id, timestamp, event_type, analysis_id, bar_time, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO trade_events (trade_id, symbol, timestamp, event_type, analysis_id, bar_time, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (trade_id, ts, event_type, analysis_id, bar_time, payload_json),
+                (trade_id, sym, ts, event_type, analysis_id, bar_time, payload_json),
             )
 
     def list_trades(
@@ -205,4 +224,54 @@ class Ledger:
                 "SELECT * FROM trade_events WHERE trade_id = ? ORDER BY id ASC LIMIT ?",
                 (trade_id, int(limit)),
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_events_by_symbol(
+        self,
+        symbol: str,
+        *,
+        since_ts: str | None = None,
+        limit: int = 500,
+        event_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        sym = symbol.strip().upper()
+        if not sym:
+            return []
+        q = """
+            SELECT
+              e.*,
+              COALESCE(e.symbol, t.symbol) AS resolved_symbol
+            FROM trade_events e
+            LEFT JOIN trades t ON t.trade_id = e.trade_id
+            WHERE COALESCE(e.symbol, t.symbol) = ?
+        """
+        args: list[Any] = [sym]
+        if since_ts:
+            q += " AND e.timestamp >= ?"
+            args.append(since_ts)
+        if event_types:
+            q += " AND e.event_type IN (" + ",".join("?" for _ in event_types) + ")"
+            args.extend([str(x) for x in event_types])
+        q += " ORDER BY e.timestamp ASC, e.id ASC LIMIT ?"
+        args.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(q, args).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                d["symbol"] = d.pop("resolved_symbol", d.get("symbol"))
+                out.append(d)
+            return out
+
+    def get_active_trades(self, symbols: list[str]) -> list[dict[str, Any]]:
+        syms = [s.strip().upper() for s in symbols if s and s.strip()]
+        if not syms:
+            return []
+        q = (
+            "SELECT * FROM trades WHERE symbol IN ("
+            + ",".join("?" for _ in syms)
+            + ") AND COALESCE(contracts_remaining, 0) > 0 AND (exit_time IS NULL OR exit_time = '') ORDER BY updated_at DESC"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(q, syms).fetchall()
             return [dict(r) for r in rows]

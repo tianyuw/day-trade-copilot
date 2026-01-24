@@ -24,7 +24,7 @@ type Bar = {
   v?: number
   ui_marker?: {
     color: "green" | "red"
-    kind: "follow_up" | "watch"
+    kind: "follow_up" | "watch" | "analysis"
   }
   indicators?: {
     z_score_diff?: number

@@ -1,6 +1,7 @@
 "use client"
 
 import Link from "next/link"
+import { useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { motion } from "framer-motion"
 import { TrackingMiniChart } from "../../components/TrackingMiniChart"
@@ -38,6 +39,8 @@ type MarketStatus = {
   is_open: boolean
   next_open: string
   next_close: string
+  last_rth_open?: string
+  last_rth_close?: string
 }
 
 type AnalysisResult = {
@@ -56,6 +59,7 @@ type SymbolSuggestion = { symbol: string; name?: string; exchange?: string }
 
 const DEFAULT_WATCHLIST = ["META", "NVDA", "TSM", "PLTR", "AAPL", "NFLX", "SPY", "QQQ"]
 const WATCHLIST_STORAGE_KEY = "tracking:watchlist"
+const DEV_PLAYBACK_START_UTC = "2026-01-23T14:30:00Z"
 
 function formatCountdown(ms: number): string {
   const clamped = Math.max(0, ms)
@@ -67,11 +71,49 @@ function formatCountdown(ms: number): string {
   return `${pad2(h)}:${pad2(m)}:${pad2(s)}`
 }
 
+function formatCountdownDhM(ms: number): string {
+  if (!Number.isFinite(ms)) return "--"
+  const clamped = Math.max(0, ms)
+  const totalMinutes = Math.floor(clamped / 60_000)
+  const d = Math.floor(totalMinutes / (60 * 24))
+  const h = Math.floor((totalMinutes % (60 * 24)) / 60)
+  const m = totalMinutes % 60
+  const parts: string[] = []
+  if (d > 0) parts.push(`${d}d`)
+  if (d > 0 || h > 0) parts.push(`${h}h`)
+  parts.push(`${m}m`)
+  return parts.join(" ")
+}
+
+function formatInTz(rfc3339: string, timeZone: string): string {
+  const ms = Date.parse(rfc3339)
+  if (!Number.isFinite(ms)) return ""
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }).format(new Date(ms))
+  } catch {
+    return ""
+  }
+}
+
 function marketLabel(session: MarketStatus["session"]): string {
   if (session === "regular") return "Regular"
   if (session === "pre_market") return "Pre-Market"
   if (session === "after_hours") return "After-Hours"
   return "Closed"
+}
+
+function offHoursLabel(session: MarketStatus["session"]): string {
+  if (session === "pre_market") return "Pre-market"
+  if (session === "after_hours") return "After-hours"
+  if (session === "closed") return "Closed"
+  return "Off Hours"
 }
 
 function marketPillClass(session: MarketStatus["session"]): string {
@@ -108,15 +150,29 @@ export default function TrackingPage() {
     >
   >({})
   const [prevCloseBySymbol, setPrevCloseBySymbol] = useState<Record<string, number | null>>({})
+  const [prevSessionBySymbol, setPrevSessionBySymbol] = useState<
+    Record<string, { open: number | null; close: number | null; openToClosePct: number | null }>
+  >({})
   const [market, setMarket] = useState<MarketStatus | null>(null)
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("closed")
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
+  const prevCloseReqRef = useRef(0)
   const addInputRef = useRef<HTMLInputElement | null>(null)
   const pressTimerRef = useRef<number | null>(null)
   const suppressNextClickRef = useRef(false)
 
+  const searchParams = useSearchParams()
+  const isDev = searchParams.get("dev") === "true"
+
   const symbolsParam = useMemo(() => watchlist.join(","), [watchlist])
+  const isOffHours = useMemo(() => !isDev && !!market && market.session !== "regular", [isDev, market])
+
+  const [bannerNowMs, setBannerNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const t = window.setInterval(() => setBannerNowMs(Date.now()), 60_000)
+    return () => window.clearInterval(t)
+  }, [])
 
   useEffect(() => {
     try {
@@ -209,22 +265,160 @@ export default function TrackingPage() {
   }, [])
 
   useEffect(() => {
-    async function fetchPrevClose() {
+    if (!watchlistHydrated) return
+    if (watchlist.length === 0) return
+
+    const reqId = ++prevCloseReqRef.current
+    const controller = new AbortController()
+
+    ;(async () => {
       try {
         const base =
           process.env.NEXT_PUBLIC_BACKEND_API ??
           `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
         const asof = new Date().toISOString()
-        const res = await fetch(`${base}/api/stocks/prev_close?symbols=${encodeURIComponent(symbolsParam)}&asof=${encodeURIComponent(asof)}`)
+        const res = await fetch(
+          `${base}/api/stocks/prev_close?symbols=${encodeURIComponent(symbolsParam)}&asof=${encodeURIComponent(asof)}`,
+          { signal: controller.signal },
+        )
         if (!res.ok) throw new Error("prev_close failed")
         const data = await res.json()
+        if (controller.signal.aborted) return
+        if (reqId !== prevCloseReqRef.current) return
         setPrevCloseBySymbol((data?.prev_close ?? {}) as Record<string, number | null>)
       } catch {
-        setPrevCloseBySymbol({})
+        if (controller.signal.aborted) return
       }
-    }
-    if (watchlist.length > 0) fetchPrevClose()
-  }, [symbolsParam, watchlist.length])
+    })()
+
+    return () => controller.abort()
+  }, [symbolsParam, watchlist.length, watchlistHydrated])
+
+  useEffect(() => {
+    if (!watchlistHydrated) return
+    if (watchlist.length === 0) return
+
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const base =
+          process.env.NEXT_PUBLIC_BACKEND_API ??
+          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
+        const res = await fetch(`${base}/api/trades/active?symbols=${encodeURIComponent(symbolsParam)}`, {
+          signal: controller.signal,
+        })
+        if (!res.ok) throw new Error("active trades failed")
+        const data = await res.json()
+        if (controller.signal.aborted) return
+        const active = (data?.active ?? {}) as Record<
+          string,
+          { in_position?: boolean; state?: string; contracts_total?: number | null; contracts_remaining?: number | null }
+        >
+        setSessionBySymbol((prev) => {
+          const next = { ...prev }
+          for (const sym of watchlist) {
+            const a = active?.[sym]
+            if (!a) continue
+            if (!a.in_position) continue
+            next[sym] = {
+              state: String(a.state ?? "IN_POSITION"),
+              inPosition: true,
+              contractsRemaining: a.contracts_remaining ?? null,
+              contractsTotal: a.contracts_total ?? null,
+            }
+          }
+          return next
+        })
+      } catch {}
+    })()
+    return () => controller.abort()
+  }, [symbolsParam, watchlist, watchlistHydrated])
+
+  useEffect(() => {
+    if (!watchlistHydrated) return
+    if (!isOffHours) return
+    if (watchlist.length === 0) return
+
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const base =
+          process.env.NEXT_PUBLIC_BACKEND_API ??
+          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
+        const res = await fetch(`${base}/api/stocks/bars?symbols=${encodeURIComponent(symbolsParam)}&timeframe=1Day&limit=10`, {
+          signal: controller.signal,
+        })
+        if (!res.ok) throw new Error("prev session daily failed")
+        const data = await res.json()
+        if (controller.signal.aborted) return
+        const barsBy = (data?.bars ?? {}) as Record<string, any[]>
+        const next: Record<string, { open: number | null; close: number | null; openToClosePct: number | null }> = {}
+        for (const sym of watchlist) {
+          const daily = Array.isArray(barsBy?.[sym]) ? (barsBy[sym] as any[]) : []
+          let best: any | null = null
+          let bestMs = -Infinity
+          for (const b of daily) {
+            const ms = Date.parse(String(b?.t ?? ""))
+            if (!Number.isFinite(ms)) continue
+            if (ms > bestMs) {
+              bestMs = ms
+              best = b
+            }
+          }
+          const o = typeof best?.o === "number" ? (best.o as number) : null
+          const c = typeof best?.c === "number" ? (best.c as number) : null
+          const pct = typeof o === "number" && typeof c === "number" && o !== 0 ? ((c - o) / o) * 100 : null
+          next[sym] = { open: o, close: c, openToClosePct: pct }
+        }
+        setPrevSessionBySymbol(next)
+      } catch {
+        if (!controller.signal.aborted) setPrevSessionBySymbol({})
+      }
+    })()
+
+    return () => controller.abort()
+  }, [isOffHours, symbolsParam, watchlist, watchlist.length, watchlistHydrated])
+
+  useEffect(() => {
+    if (!watchlistHydrated) return
+    if (!isOffHours) return
+    if (watchlist.length === 0) return
+    const start = market?.last_rth_open
+    const end = market?.last_rth_close
+    if (!start || !end) return
+
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const base =
+          process.env.NEXT_PUBLIC_BACKEND_API ??
+          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
+        const res = await fetch(
+          `${base}/api/stocks/bars?symbols=${encodeURIComponent(symbolsParam)}&timeframe=5Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=10000`,
+          { signal: controller.signal },
+        )
+        if (!res.ok) throw new Error("prev session 5m failed")
+        const data = await res.json()
+        if (controller.signal.aborted) return
+        const barsBy = (data?.bars ?? {}) as Record<string, any[]>
+        setBarsBySymbol((prev) => {
+          const next = { ...prev }
+          for (const sym of watchlist) next[sym] = Array.isArray(barsBy?.[sym]) ? (barsBy[sym] as any[]) : []
+          return next
+        })
+      } catch {
+        if (!controller.signal.aborted) {
+          setBarsBySymbol((prev) => {
+            const next = { ...prev }
+            for (const sym of watchlist) next[sym] = []
+            return next
+          })
+        }
+      }
+    })()
+
+    return () => controller.abort()
+  }, [isOffHours, market?.last_rth_open, market?.last_rth_close, symbolsParam, watchlist, watchlist.length, watchlistHydrated])
 
   useEffect(() => {
     intentionalCloseRef.current = true
@@ -232,6 +426,10 @@ export default function TrackingPage() {
     wsRef.current = null
 
     if (watchlist.length === 0) return
+    if (isOffHours) {
+      setWsStatus("closed")
+      return
+    }
 
     intentionalCloseRef.current = false
     setWsStatus("connecting")
@@ -239,7 +437,13 @@ export default function TrackingPage() {
     const base =
       process.env.NEXT_PUBLIC_BACKEND_WS ??
       `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
-    const url = `${base}/ws/realtime?symbols=${encodeURIComponent(symbolsParam)}&analyze=true`
+    
+    let url = ""
+    if (isDev) {
+      url = `${base}/ws/playback?symbols=${encodeURIComponent(symbolsParam)}&start=${encodeURIComponent(DEV_PLAYBACK_START_UTC)}&speed=1.0&flow=timer`
+    } else {
+      url = `${base}/ws/realtime?symbols=${encodeURIComponent(symbolsParam)}&analyze=true`
+    }
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -291,7 +495,7 @@ export default function TrackingPage() {
       intentionalCloseRef.current = true
       ws.close()
     }
-  }, [symbolsParam, watchlist.length])
+  }, [isDev, isOffHours, symbolsParam, watchlist.length])
 
   const sortedSymbols = useMemo(() => {
     const inPos: string[] = []
@@ -347,7 +551,8 @@ export default function TrackingPage() {
 
   return (
     <main className="flex min-h-screen flex-col bg-neon-radial text-white font-sans">
-      <div className="flex-none border-b border-white/10 bg-black/20 backdrop-blur-xl px-6 py-4">
+      <div className="sticky top-0 z-40 flex-none border-b border-white/10 bg-black/20 backdrop-blur-xl">
+        <div className="px-6 py-4">
         <div className="mx-auto flex max-w-[1600px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-3">
@@ -356,6 +561,12 @@ export default function TrackingPage() {
                 <span className={cn("h-2 w-2 rounded-full", market?.session === "regular" ? "bg-emerald-400" : market?.session === "closed" ? "bg-white/30" : "bg-cyan-400")} />
                 {market ? marketLabel(market.session) : "Unknown"}
               </div>
+              {isDev && (
+                <div className="flex items-center gap-2 rounded-full bg-amber-500/10 px-3 py-1 text-xs font-bold text-amber-300 ring-1 ring-amber-500/30">
+                  <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+                  DEV REPLAY (1x)
+                </div>
+              )}
               {countdown && (
                 <div className="hidden sm:flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-mono text-white/60 ring-1 ring-white/10">
                   <span className="text-white/40">{countdown.label}</span>
@@ -373,10 +584,29 @@ export default function TrackingPage() {
                   wsStatus === "open" ? "bg-emerald-400" : wsStatus === "connecting" ? "bg-cyan-400" : wsStatus === "error" ? "bg-red-400" : "bg-white/30",
                 )}
               />
-              {wsStatus === "open" ? "AI Monitoring" : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
+              {wsStatus === "open" ? (isDev ? "Replaying" : "AI Monitoring") : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
             </div>
           </div>
         </div>
+        </div>
+
+        {isOffHours && market && (
+          <div className="px-6 pb-4">
+            <div className="mx-auto max-w-[1600px] rounded-xl bg-amber-500/10 px-4 py-3 text-amber-200 ring-1 ring-amber-500/30">
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-sm font-bold">
+                  {offHoursLabel(market.session)} · Next RTH Open{" "}
+                  <span className="font-mono text-amber-200/80">
+                    {formatInTz(market.next_open, "America/New_York")} ET / {formatInTz(market.next_open, "America/Los_Angeles")} PT
+                  </span>
+                </div>
+                <div className="text-xs font-mono text-amber-200/80" aria-live="polite">
+                  Next RTH opens in {formatCountdownDhM(Date.parse(market.next_open) - bannerNowMs)}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 p-6">
@@ -386,11 +616,14 @@ export default function TrackingPage() {
               const bars = barsBySymbol[sym] ?? []
               const last = bars.length ? bars[bars.length - 1] : null
               const prevClose = prevCloseBySymbol[sym]
+              const prevSess = prevSessionBySymbol[sym]
               const price = typeof last?.c === "number" ? last.c : null
               const changePct =
                 typeof price === "number" && typeof prevClose === "number" && prevClose !== 0
                   ? ((price - prevClose) / prevClose) * 100
                   : null
+              const offHoursClose = prevSess?.close ?? null
+              const offHoursPct = prevSess?.openToClosePct ?? null
               const a = analysisBySymbol[sym]
               const sess = sessionBySymbol[sym]
               const inPosition = sess?.inPosition && (sess.contractsRemaining ?? 0) > 0
@@ -465,21 +698,32 @@ export default function TrackingPage() {
                       <div className="min-w-0">
                         <div className="flex items-baseline gap-2">
                           <div className="text-xl font-black tracking-tight">{sym}</div>
-                          {typeof price === "number" && (
+                          {isOffHours ? (
+                            typeof offHoursClose === "number" ? (
+                              <div className="text-sm font-mono text-white/80">{offHoursClose.toFixed(2)}</div>
+                            ) : null
+                          ) : typeof price === "number" ? (
                             <div className="text-sm font-mono text-white/80">{price.toFixed(2)}</div>
-                          )}
-                          {typeof changePct === "number" && (
+                          ) : null}
+                          {isOffHours ? (
+                            typeof offHoursPct === "number" ? (
+                              <div className={cn("text-xs font-bold", offHoursPct >= 0 ? "text-emerald-400" : "text-red-400")}>
+                                {offHoursPct >= 0 ? "+" : ""}
+                                {offHoursPct.toFixed(2)}%
+                              </div>
+                            ) : null
+                          ) : typeof changePct === "number" ? (
                             <div className={cn("text-xs font-bold", changePct >= 0 ? "text-emerald-400" : "text-red-400")}>
                               {changePct >= 0 ? "+" : ""}
                               {changePct.toFixed(2)}%
                             </div>
-                          )}
+                          ) : null}
                         </div>
                         <div className="mt-1 flex items-center gap-2 text-xs text-white/50">
                           <div className="truncate">
-                            {a?.pattern_name ? a.pattern_name : a?.action ? a.action.replace(/_/g, " ") : "Scanning"}
+                            {isOffHours ? "Prev Session" : a?.pattern_name ? a.pattern_name : a?.action ? a.action.replace(/_/g, " ") : "Scanning"}
                           </div>
-                          {a?.confidence != null && (
+                          {!isOffHours && a?.confidence != null && (
                             <div className="flex-none font-mono text-white/40">{Math.round(a.confidence * 100)}%</div>
                           )}
                         </div>
@@ -488,19 +732,26 @@ export default function TrackingPage() {
                       <div
                         className={cn(
                           "flex-none rounded-lg px-2 py-1 text-[10px] font-black uppercase tracking-wider",
-                          hasSignal
+                          isOffHours
+                            ? "bg-white/5 text-white/50 ring-1 ring-white/10"
+                            : hasSignal
                             ? a?.action === "buy_long"
                               ? "bg-emerald-500/20 text-emerald-200 ring-1 ring-emerald-500/40"
                               : "bg-red-500/20 text-red-200 ring-1 ring-red-500/40"
                             : "bg-white/5 text-white/50 ring-1 ring-white/10",
                         )}
                       >
-                        {hasSignal ? (a!.action === "buy_long" ? "BUY LONG" : "BUY SHORT") : "SCANNING"}
+                        {isOffHours ? "OFF HOURS" : hasSignal ? (a!.action === "buy_long" ? "BUY LONG" : "BUY SHORT") : "SCANNING"}
                       </div>
                     </div>
 
-                    <div className="mt-3">
-                      <TrackingMiniChart bars={bars} />
+                    <div className="relative mt-3">
+                      {isOffHours && <div className="absolute right-2 top-2 z-10 text-[10px] font-bold text-white/35">Prev Session · 5m</div>}
+                      <TrackingMiniChart
+                        bars={bars}
+                        windowMinutes={isOffHours ? 390 : 120}
+                        anchorTimeRfc3339={isDev ? DEV_PLAYBACK_START_UTC : isOffHours ? market?.last_rth_close : undefined}
+                      />
                     </div>
                   </div>
                 </Link>

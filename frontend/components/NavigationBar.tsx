@@ -34,13 +34,13 @@ export function NavigationBar() {
         const res = await fetch(`${baseHttp}/api/settings/trading`, { method: "GET" })
         if (!res.ok) return
         const body = (await res.json()) as {
-          paper_auto_trade_enabled?: unknown
+          auto_trade_execution_enabled?: unknown
           live_trading_enabled?: unknown
           default_execution?: unknown
         }
-        if (typeof body.paper_auto_trade_enabled === "boolean") {
-          setTradingExecutionEnabled(body.paper_auto_trade_enabled)
-          window.localStorage.setItem("tradingExecutionEnabled", String(body.paper_auto_trade_enabled))
+        if (typeof body.auto_trade_execution_enabled === "boolean") {
+          setTradingExecutionEnabled(body.auto_trade_execution_enabled)
+          window.localStorage.setItem("tradingExecutionEnabled", String(body.auto_trade_execution_enabled))
         }
         if (body.default_execution === "paper" || body.default_execution === "live") {
           setDefaultExecution(body.default_execution)
@@ -74,7 +74,7 @@ export function NavigationBar() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            paper_auto_trade_enabled: enabled,
+            auto_trade_execution_enabled: enabled,
             live_trading_enabled: Boolean(enabled && execution === "live"),
             default_execution: execution,
           }),

@@ -36,9 +36,15 @@ class AlpacaClient:
         if start is None:
             start = (now - timedelta(days=7)).isoformat().replace("+00:00", "Z")
 
-        request_limit = limit
         if len(symbols) > 1:
-            request_limit = min(10000, max(1000, limit * len(symbols)))
+            async def fetch_one(sym: str) -> tuple[str, list[AlpacaBar]]:
+                data = await self.get_bars([sym], timeframe=timeframe, start=start, end=end, limit=limit)
+                return sym, data.get(sym, [])
+
+            pairs = await asyncio.gather(*[fetch_one(s) for s in symbols])
+            return {sym: bars for sym, bars in pairs}
+
+        request_limit = min(10000, max(1, limit))
 
         params = {
             "symbols": ",".join(symbols),

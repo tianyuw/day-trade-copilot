@@ -39,34 +39,86 @@ function formatPTFromUtcSeconds(utcSeconds: number): string {
   }
 }
 
-function windowLastMinutes(bars: Bar[], minutes: number): Bar[] {
+function floorToMinute(ms: number): number {
+  return Math.floor(ms / 60_000) * 60_000
+}
+
+function windowLastMinutes(bars: Bar[], minutes: number, anchorTimeRfc3339?: string): Bar[] {
   if (bars.length === 0) return []
-  const last = bars[bars.length - 1]
-  const endMs = new Date(last.t).getTime()
-  if (!Number.isFinite(endMs)) return bars.slice(-minutes)
-  const startMs = endMs - minutes * 60_000
-  const filtered = bars.filter((b) => {
-    const ms = new Date(b.t).getTime()
-    return Number.isFinite(ms) && ms >= startMs && ms <= endMs
-  })
-  return filtered.length ? filtered : bars.slice(-minutes)
+
+  const nowMs = Date.now()
+  const lastBarMs = new Date(bars[bars.length - 1]!.t).getTime()
+  const anchorOverrideMs = anchorTimeRfc3339 ? new Date(anchorTimeRfc3339).getTime() : NaN
+  const anchorMs = Number.isFinite(anchorOverrideMs) ? anchorOverrideMs : Number.isFinite(lastBarMs) ? lastBarMs : nowMs
+  const endMs = floorToMinute(Number.isFinite(anchorMs) ? anchorMs : nowMs)
+  const startMs = endMs - (minutes - 1) * 60_000
+
+  const byMinute = new Map<number, Bar>()
+  for (const b of bars) {
+    const ms = floorToMinute(new Date(b.t).getTime())
+    if (!Number.isFinite(ms)) continue
+    if (ms < startMs - 60_000 * 5 || ms > endMs + 60_000 * 5) continue
+    byMinute.set(ms, b)
+  }
+
+  let seed: number | null = null
+  const sortedBars = [...bars]
+    .map((b) => ({ b, ms: new Date(b.t).getTime() }))
+    .filter((x) => Number.isFinite(x.ms))
+    .sort((a, b) => a.ms - b.ms)
+
+  for (let i = sortedBars.length - 1; i >= 0; i--) {
+    if (sortedBars[i]!.ms <= startMs) {
+      seed = sortedBars[i]!.b.c
+      break
+    }
+  }
+  if (seed == null) {
+    const first = sortedBars.find((x) => x.ms >= startMs && x.ms <= endMs)?.b
+    if (first) seed = typeof first.o === "number" && first.o > 0 ? first.o : first.c
+  }
+  if (seed == null) return []
+
+  const out: Bar[] = []
+  let prevClose = seed
+  for (let ms = startMs; ms <= endMs; ms += 60_000) {
+    const bar = byMinute.get(ms)
+    if (bar) {
+      out.push(bar)
+      prevClose = bar.c
+      continue
+    }
+    out.push({
+      t: new Date(ms).toISOString(),
+      o: prevClose,
+      h: prevClose,
+      l: prevClose,
+      c: prevClose,
+    })
+  }
+  return out
 }
 
 export function TrackingMiniChart({
   bars,
   className,
   windowMinutes = 120,
+  anchorTimeRfc3339,
 }: {
   bars: Bar[]
   className?: string
   windowMinutes?: number
+  anchorTimeRfc3339?: string
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null)
   const pctSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
 
-  const windowBars = useMemo(() => windowLastMinutes(bars, windowMinutes), [bars, windowMinutes])
+  const windowBars = useMemo(
+    () => windowLastMinutes(bars, windowMinutes, anchorTimeRfc3339),
+    [anchorTimeRfc3339, bars, windowMinutes],
+  )
 
   const candles = useMemo(() => {
     const out: CandlestickData<Time>[] = []
@@ -199,4 +251,3 @@ export function TrackingMiniChart({
     </div>
   )
 }
-

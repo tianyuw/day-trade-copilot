@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -27,7 +28,7 @@ from .schemas import (
     PositionManagementResponse,
     TradingSettings,
 )
-from .trade_session import SymbolSession, TradeState, _to_epoch_seconds
+from .trade_session import ActiveTrade, SymbolSession, TradeState, _to_epoch_seconds
 from .trading_schemas import (
     CancelOrderRequest,
     ClosePositionRequest,
@@ -56,7 +57,7 @@ def create_app() -> FastAPI:
     assets_lock = asyncio.Lock()
     assets_cache: dict[str, object] = {"expires_at": 0.0, "assets": []}
     assets_ttl_seconds = 6 * 60 * 60
-    paper_auto_trade_enabled = False
+    auto_trade_execution_enabled = False
     live_trading_enabled = False
     default_execution: ExecutionMode = ExecutionMode.paper
     option_synth_oco: dict[str, dict[str, Any]] = {}
@@ -79,21 +80,21 @@ def create_app() -> FastAPI:
     @app.get("/api/settings/trading", response_model=TradingSettings)
     async def get_trading_settings() -> TradingSettings:
         return TradingSettings(
-            paper_auto_trade_enabled=paper_auto_trade_enabled,
+            auto_trade_execution_enabled=auto_trade_execution_enabled,
             live_trading_enabled=live_trading_enabled,
             default_execution=default_execution.value,
         )
 
     @app.post("/api/settings/trading", response_model=TradingSettings)
     async def set_trading_settings(payload: TradingSettings) -> TradingSettings:
-        nonlocal paper_auto_trade_enabled
+        nonlocal auto_trade_execution_enabled
         nonlocal live_trading_enabled
         nonlocal default_execution
-        paper_auto_trade_enabled = bool(payload.paper_auto_trade_enabled)
+        auto_trade_execution_enabled = bool(payload.auto_trade_execution_enabled)
         live_trading_enabled = bool(payload.live_trading_enabled)
         default_execution = ExecutionMode(payload.default_execution)
         return TradingSettings(
-            paper_auto_trade_enabled=paper_auto_trade_enabled,
+            auto_trade_execution_enabled=auto_trade_execution_enabled,
             live_trading_enabled=live_trading_enabled,
             default_execution=default_execution.value,
         )
@@ -134,6 +135,8 @@ def create_app() -> FastAPI:
         next_open = next_weekday_open(now_et).astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
         next_close = (datetime.fromisoformat(next_open.replace("Z", "+00:00")) + timedelta(hours=6, minutes=30)).isoformat().replace("+00:00", "Z")
         server_time = now_et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        last_rth_open = ""
+        last_rth_close = ""
 
         if clock and isinstance(clock, dict):
             try:
@@ -148,12 +151,29 @@ def create_app() -> FastAPI:
             except Exception:
                 pass
 
+        try:
+            dt_utc = datetime.fromisoformat(server_time.replace("Z", "+00:00"))
+            ts_et = dt_utc.astimezone(et)
+            minutes = ts_et.hour * 60 + ts_et.minute
+            last_date = ts_et.date() if minutes >= 16 * 60 else (ts_et - timedelta(days=1)).date()
+            while last_date.weekday() >= 5:
+                last_date = (datetime(last_date.year, last_date.month, last_date.day, tzinfo=et) - timedelta(days=1)).date()
+            last_open_et = datetime(last_date.year, last_date.month, last_date.day, 9, 30, tzinfo=et)
+            last_close_et = datetime(last_date.year, last_date.month, last_date.day, 16, 0, tzinfo=et)
+            last_rth_open = last_open_et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            last_rth_close = last_close_et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        except Exception:
+            last_rth_open = ""
+            last_rth_close = ""
+
         return {
             "server_time": server_time,
             "session": session,
             "is_open": is_open,
             "next_open": next_open,
             "next_close": next_close,
+            "last_rth_open": last_rth_open,
+            "last_rth_close": last_rth_close,
         }
 
     @app.post("/api/analyze", response_model=LLMAnalysisResponse)
@@ -165,14 +185,15 @@ def create_app() -> FastAPI:
             response = await analysis_service.analyze_signal(request)
             payload = response.model_dump()
             plan = payload.get("trade_plan") if isinstance(payload, dict) else None
-            if isinstance(plan, dict) and plan.get("trade_id"):
-                trade_id = str(plan.get("trade_id"))
+            trade_id: str | None = str(plan.get("trade_id")) if isinstance(plan, dict) and plan.get("trade_id") else None
+            if trade_id:
                 ledger.upsert_trade(
                     {
                         "trade_id": trade_id,
                         "symbol": str(payload.get("symbol") or request.symbol).upper(),
                         "mode": str(getattr(request, "mode", "realtime") or "realtime"),
-                        "execution": "paper" if paper_auto_trade_enabled else "simulated",
+                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                        "state": "ENTRY_PENDING",
                         "option_symbol": None,
                         "option_right": plan.get("option", {}).get("right") if isinstance(plan.get("option"), dict) else None,
                         "option_expiration": plan.get("option", {}).get("expiration") if isinstance(plan.get("option"), dict) else None,
@@ -180,16 +201,24 @@ def create_app() -> FastAPI:
                         "contracts_total": plan.get("contracts"),
                         "contracts_remaining": plan.get("contracts"),
                         "entry_time": payload.get("timestamp"),
+                        "extra": {
+                            "direction": plan.get("direction"),
+                            "risk": plan.get("risk"),
+                            "take_profit_premium": plan.get("take_profit_premium"),
+                        },
                     }
                 )
-                ledger.append_event(
-                    trade_id=trade_id,
-                    event_type="ai_verify_result",
-                    timestamp=str(payload.get("timestamp") or ""),
-                    analysis_id=str(payload.get("analysis_id") or ""),
-                    bar_time=str(payload.get("timestamp") or request.current_time),
-                    payload=payload,
-                )
+            analysis_id = str(payload.get("analysis_id") or "")
+            event_trade_id = trade_id or (f"analysis:{analysis_id}" if analysis_id else f"analysis:{request.symbol}:{payload.get('timestamp')}")
+            ledger.append_event(
+                trade_id=event_trade_id,
+                event_type="llm_analysis_result",
+                symbol=str(payload.get("symbol") or request.symbol).upper(),
+                timestamp=str(payload.get("timestamp") or ""),
+                analysis_id=analysis_id,
+                bar_time=str(payload.get("timestamp") or request.current_time),
+                payload=payload,
+            )
             _append_analysis_history(response)
             return response
         except Exception as e:
@@ -284,18 +313,119 @@ def create_app() -> FastAPI:
             else:
                 prev_close[sym] = float(bars[-1].c)
 
+        missing = [s for s in symbol_list if prev_close.get(s) is None]
+        if missing:
+            async def fallback(sym: str) -> tuple[str, float | None]:
+                try:
+                    data = await alpaca.get_bars([sym], timeframe="1Day", limit=10)
+                    bars = data.get(sym, [])
+                    if bars:
+                        idx_today: int | None = None
+                        for i, b in enumerate(bars):
+                            try:
+                                bar_date_et = parse_rfc3339(b.t).astimezone(et).date()
+                            except Exception:
+                                continue
+                            if bar_date_et == asof_date_et:
+                                idx_today = i
+                        if idx_today is not None and idx_today - 1 >= 0:
+                            return sym, float(bars[idx_today - 1].c)
+                        return sym, float(bars[-1].c)
+                except Exception:
+                    pass
+
+                try:
+                    snap = await alpaca.get_snapshots([sym])
+                    s = snap.get(sym) if isinstance(snap, dict) else None
+                    prev = s.get("prevDailyBar") if isinstance(s, dict) else None
+                    if isinstance(prev, dict) and prev.get("c") is not None:
+                        return sym, float(prev.get("c"))
+                except Exception:
+                    pass
+
+                return sym, None
+
+            pairs = await asyncio.gather(*[fallback(s) for s in missing])
+            for sym, val in pairs:
+                if val is not None:
+                    prev_close[sym] = val
+
         return {"prev_close": prev_close}
 
+    def _et_midnight_utc_iso(now_utc: datetime) -> str:
+        et = ZoneInfo("America/New_York")
+        now_et = now_utc.astimezone(et)
+        midnight_et = datetime(now_et.year, now_et.month, now_et.day, tzinfo=et)
+        return midnight_et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
     @app.get("/api/ai/history/{symbol}")
-    async def ai_history(symbol: str) -> dict:
+    async def ai_history(
+        symbol: str,
+        since: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=5000)] = 1000,
+    ) -> dict:
         sym = symbol.strip().upper()
         if not sym:
             raise HTTPException(status_code=400, detail="symbol required")
-        return {
-            "symbol": sym,
-            "analysis": [r.model_dump() for r in analysis_history.get(sym, [])],
-            "positions": [r.model_dump() for r in position_history.get(sym, [])],
-        }
+
+        since_ts = since or _et_midnight_utc_iso(datetime.now(ZoneInfo("UTC")))
+        events = ledger.list_events_by_symbol(
+            sym,
+            since_ts=since_ts,
+            limit=limit,
+            event_types=["llm_analysis_result", "ai_verify_result", "position_mgmt_requested", "position_mgmt_result"],
+        )
+
+        analysis: list[dict[str, Any]] = []
+        positions: list[dict[str, Any]] = []
+        for e in events:
+            payload_json = e.get("payload_json")
+            payload: Any = None
+            if isinstance(payload_json, str) and payload_json:
+                try:
+                    payload = json.loads(payload_json)
+                except Exception:
+                    payload = None
+            item = payload if isinstance(payload, dict) else {"raw": payload_json}
+            item_ts = str(e.get("timestamp") or "")
+            item.setdefault("timestamp", item_ts)
+            item.setdefault("bar_time", e.get("bar_time"))
+            item.setdefault("analysis_id", e.get("analysis_id"))
+            item.setdefault("trade_id", e.get("trade_id"))
+            item.setdefault("symbol", sym)
+
+            etype = str(e.get("event_type") or "")
+            if etype in {"position_mgmt_result", "position_mgmt_requested"}:
+                positions.append(item)
+            else:
+                analysis.append(item)
+
+        return {"symbol": sym, "analysis": analysis, "positions": positions}
+
+    @app.get("/api/trades/active")
+    async def active_trades(symbols: Annotated[str, Query(min_length=1)]) -> dict:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        rows = ledger.get_active_trades(symbol_list)
+        by_symbol: dict[str, dict[str, Any]] = {s: {"in_position": False} for s in symbol_list}
+        for r in rows:
+            sym = str(r.get("symbol") or "").upper()
+            if not sym:
+                continue
+            by_symbol[sym] = {
+                "in_position": True,
+                "trade_id": r.get("trade_id"),
+                "state": r.get("state") or "IN_POSITION",
+                "contracts_total": r.get("contracts_total"),
+                "contracts_remaining": r.get("contracts_remaining"),
+                "option": {
+                    "right": r.get("option_right"),
+                    "expiration": r.get("option_expiration"),
+                    "strike": r.get("option_strike"),
+                },
+                "option_symbol": r.get("option_symbol"),
+                "updated_at": r.get("updated_at"),
+            }
+        return {"active": by_symbol}
 
     @app.get("/api/options/contracts")
     async def options_contracts(
@@ -428,9 +558,10 @@ def create_app() -> FastAPI:
         ledger.append_event(
             trade_id=req.trade_id,
             event_type="position_mgmt_requested",
+            symbol=req.symbol,
             timestamp=req.bar_time,
             bar_time=req.bar_time,
-            payload={"symbol": req.symbol, "execution": "paper" if paper_auto_trade_enabled else "simulated"},
+            payload={"symbol": req.symbol, "execution": default_execution.value if auto_trade_execution_enabled else "simulated"},
         )
         res = await analysis_service.manage_position(req)
         _append_position_history(res)
@@ -438,11 +569,42 @@ def create_app() -> FastAPI:
         ledger.append_event(
             trade_id=req.trade_id,
             event_type="position_mgmt_result",
+            symbol=req.symbol,
             timestamp=str(payload.get("timestamp") or req.bar_time),
             analysis_id=str(payload.get("analysis_id") or ""),
             bar_time=req.bar_time,
             payload=payload,
         )
+        try:
+            t = ledger.get_trade(req.trade_id) or {}
+            remaining = t.get("contracts_remaining")
+            try:
+                remaining_i = int(remaining) if remaining is not None else int(req.position.get("contracts_remaining") or 0)
+            except Exception:
+                remaining_i = int(req.position.get("contracts_remaining") or 0)
+            d = payload.get("decision") if isinstance(payload, dict) else None
+            act = str(d.get("action") or "") if isinstance(d, dict) else ""
+            if act == "close_all":
+                remaining_i = 0
+            elif act == "close_partial":
+                exit_ = d.get("exit") if isinstance(d, dict) else None
+                n = int(exit_.get("contracts_to_close") or 0) if isinstance(exit_, dict) else 0
+                remaining_i = max(0, remaining_i - max(0, n))
+            exit_time = str(payload.get("timestamp") or req.bar_time) if remaining_i <= 0 else None
+            ledger.upsert_trade(
+                {
+                    "trade_id": req.trade_id,
+                    "symbol": req.symbol,
+                    "mode": str(getattr(req, "mode", "realtime") or "realtime"),
+                    "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                    "state": "CLOSED" if remaining_i <= 0 else "IN_POSITION",
+                    "contracts_total": (t.get("contracts_total") if isinstance(t, dict) else None) or req.position.get("contracts_total"),
+                    "contracts_remaining": remaining_i,
+                    "exit_time": exit_time,
+                }
+            )
+        except Exception:
+            pass
         return res
 
     def require_execution(execution: ExecutionMode) -> ExecutionMode:
@@ -704,6 +866,60 @@ def create_app() -> FastAPI:
                     option_symbol=s.trade.option_symbol if s.trade else None,
                 ).model_dump()
             )
+
+        try:
+            active_rows = ledger.get_active_trades(symbol_list)
+            for r in active_rows:
+                sym = str(r.get("symbol") or "").upper()
+                s = sessions.get(sym)
+                if not s:
+                    continue
+                extra: dict[str, Any] = {}
+                try:
+                    raw = r.get("extra_json")
+                    if isinstance(raw, str) and raw:
+                        parsed = json.loads(raw)
+                        extra = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    extra = {}
+
+                try:
+                    contracts_total = int(r.get("contracts_total") or 0)
+                    contracts_remaining = int(r.get("contracts_remaining") or 0)
+                except Exception:
+                    continue
+                if contracts_remaining <= 0:
+                    continue
+
+                direction = str(extra.get("direction") or "")
+                opt = {
+                    "right": r.get("option_right"),
+                    "expiration": r.get("option_expiration"),
+                    "strike": r.get("option_strike"),
+                }
+                risk_in = extra.get("risk") if isinstance(extra.get("risk"), dict) else {}
+                take_profit = extra.get("take_profit_premium")
+                risk = {
+                    "stop_loss_premium": risk_in.get("stop_loss_premium"),
+                    "take_profit_premium": take_profit if take_profit is not None else risk_in.get("take_profit_premium"),
+                    "time_stop_minutes": risk_in.get("time_stop_minutes"),
+                }
+
+                s.trade = ActiveTrade(
+                    trade_id=str(r.get("trade_id") or ""),
+                    direction=direction,
+                    option=opt,
+                    option_symbol=str(r.get("option_symbol") or "").upper() or None,
+                    contracts_total=contracts_total,
+                    contracts_remaining=contracts_remaining,
+                    entry_time=str(r.get("entry_time") or ""),
+                    entry_premium=r.get("entry_premium"),
+                    risk=risk,
+                )
+                st = str(r.get("state") or "IN_POSITION").upper()
+                s.state = TradeState.IN_POSITION if st == "IN_POSITION" else TradeState.IN_POSITION
+        except Exception:
+            pass
         # Fetch daily history for indicators
         today = datetime.now(ZoneInfo("America/New_York")).date()
         daily_start = (today - timedelta(days=60)).isoformat() # Get enough history
@@ -729,15 +945,27 @@ def create_app() -> FastAPI:
                     daily_bars_df[sym] = None
 
             now_utc = datetime.now(ZoneInfo("UTC"))
-            backfill_minutes = max(analysis_window_minutes, 200) + 50
+            backfill_minutes = max(analysis_window_minutes + 50, 250)
+            chart_minutes = 120
             backfill_start = (now_utc - timedelta(minutes=backfill_minutes)).isoformat().replace("+00:00", "Z")
             backfill_end = now_utc.isoformat().replace("+00:00", "Z")
 
             async def fetch_intraday(sym: str) -> tuple[str, list]:
-                data = await alpaca.get_bars([sym], timeframe="1Min", start=backfill_start, end=backfill_end, limit=200)
+                data = await alpaca.get_bars(
+                    [sym],
+                    timeframe="1Min",
+                    start=backfill_start,
+                    end=backfill_end,
+                    limit=backfill_minutes,
+                )
                 bars = data.get(sym, [])
                 if not bars:
-                    data = await alpaca.get_bars([sym], timeframe="1Min", limit=200)
+                    data = await alpaca.get_bars(
+                        [sym],
+                        timeframe="1Min",
+                        start=backfill_start,
+                        limit=backfill_minutes,
+                    )
                     bars = data.get(sym, [])
                 return sym, bars
 
@@ -760,7 +988,10 @@ def create_app() -> FastAPI:
                     bar.indicators = {**z_res, **m_res, "signal": final_signal}
                     intraday_buffers[sym].append(bar)
                 
-                await ws.send_json(StreamInitMessage(type="init", mode="realtime", symbol=sym, bars=bars).model_dump())
+                init_bars = bars[-chart_minutes:] if len(bars) > chart_minutes else bars
+                await ws.send_json(
+                    StreamInitMessage(type="init", mode="realtime", symbol=sym, bars=init_bars).model_dump()
+                )
                 await send_state(sym)
 
             async for sym, bar in alpaca.stream_minute_bars(symbol_list):
@@ -816,6 +1047,20 @@ def create_app() -> FastAPI:
                             preloaded_daily_bars=daily_bars_df.get(sym),
                             preloaded_intraday_bars=df_intraday,
                         )
+                        payload = llm_res.model_dump()
+                        plan = payload.get("trade_plan") if isinstance(payload, dict) else None
+                        trade_id = str(plan.get("trade_id")) if isinstance(plan, dict) and plan.get("trade_id") else None
+                        analysis_id = str(payload.get("analysis_id") or "")
+                        event_trade_id = trade_id or (f"analysis:{analysis_id}" if analysis_id else f"analysis:{sym}:{payload.get('timestamp')}")
+                        ledger.append_event(
+                            trade_id=event_trade_id,
+                            event_type="llm_analysis_result",
+                            symbol=sym,
+                            timestamp=str(payload.get("timestamp") or bar.t),
+                            analysis_id=analysis_id,
+                            bar_time=str(bar.t),
+                            payload=payload,
+                        )
                         await ws.send_json(
                             StreamAnalysisMessage(
                                 type="analysis",
@@ -824,7 +1069,7 @@ def create_app() -> FastAPI:
                                 result=llm_res,
                             ).model_dump()
                         )
-                        payload = llm_res.model_dump()
+                        _append_analysis_history(llm_res)
                         session.on_analysis_result(payload)
                         if payload.get("action") in ("buy_long", "buy_short") and isinstance(payload.get("trade_plan"), dict):
                             plan = payload.get("trade_plan") or {}
@@ -859,6 +1104,30 @@ def create_app() -> FastAPI:
                             except Exception:
                                 option_symbol = None
                             session.enter_from_trade_plan(payload, option_symbol=option_symbol)
+                            try:
+                                ledger.upsert_trade(
+                                    {
+                                        "trade_id": str(plan.get("trade_id") or ""),
+                                        "symbol": sym,
+                                        "mode": "realtime",
+                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                                        "state": "IN_POSITION",
+                                        "option_symbol": option_symbol,
+                                        "option_right": opt.get("right"),
+                                        "option_expiration": opt.get("expiration"),
+                                        "option_strike": opt.get("strike"),
+                                        "contracts_total": plan.get("contracts"),
+                                        "contracts_remaining": plan.get("contracts"),
+                                        "entry_time": payload.get("timestamp") or bar.t,
+                                        "extra": {
+                                            "direction": plan.get("direction"),
+                                            "risk": plan.get("risk"),
+                                            "take_profit_premium": plan.get("take_profit_premium"),
+                                        },
+                                    }
+                                )
+                            except Exception:
+                                pass
                         session.analysis_inflight = False
                         if session.state == TradeState.AI_VERIFY:
                             session.state = TradeState.SCAN
@@ -889,6 +1158,16 @@ def create_app() -> FastAPI:
                             ohlcv_1m=None,
                         )
                         pm_res = await analysis_service.manage_position(req_pm)
+                        pm_payload = pm_res.model_dump()
+                        ledger.append_event(
+                            trade_id=session.trade.trade_id,
+                            event_type="position_mgmt_result",
+                            symbol=sym,
+                            timestamp=str(pm_payload.get("timestamp") or bar.t),
+                            analysis_id=str(pm_payload.get("analysis_id") or ""),
+                            bar_time=str(bar.t),
+                            payload=pm_payload,
+                        )
                         await ws.send_json(
                             StreamPositionMessage(
                                 type="position",
@@ -897,7 +1176,40 @@ def create_app() -> FastAPI:
                                 result=pm_res,
                             ).model_dump()
                         )
+                        _append_position_history(pm_res)
                         session.on_position_decision(pm_res.model_dump())
+                        try:
+                            if session.trade:
+                                ledger.upsert_trade(
+                                    {
+                                        "trade_id": session.trade.trade_id,
+                                        "symbol": sym,
+                                        "mode": "realtime",
+                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                                        "state": "IN_POSITION",
+                                        "contracts_total": session.trade.contracts_total,
+                                        "contracts_remaining": session.trade.contracts_remaining,
+                                        "extra": {
+                                            "direction": session.trade.direction,
+                                            "risk": session.trade.risk,
+                                            "take_profit_premium": session.trade.risk.get("take_profit_premium"),
+                                        },
+                                    }
+                                )
+                            else:
+                                ledger.upsert_trade(
+                                    {
+                                        "trade_id": req_pm.trade_id,
+                                        "symbol": sym,
+                                        "mode": "realtime",
+                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                                        "state": "CLOSED",
+                                        "contracts_remaining": 0,
+                                        "exit_time": str(pm_payload.get("timestamp") or bar.t),
+                                    }
+                                )
+                        except Exception:
+                            pass
                         session.manage_inflight = False
                         await send_state(sym)
 
@@ -1034,31 +1346,23 @@ def create_app() -> FastAPI:
                         
                         bar.indicators = {**z_res, **m_res, "signal": final_signal}
 
-            history_padding = warmup_minutes
+            end_by_symbol: dict[str, int] = {}
             for sym, bars in bars_by_symbol.items():
-                # Correctly calculate slicing indices relative to the 'start' time
-                # 'safe_cursor' is roughly where the playback should start (200 bars in)
-                # But if we want the chart to end exactly at 'start' time, we need to find that index.
-                
-                # If start_dt is provided, we want the init bars to end exactly at start_dt
                 target_end_index = safe_cursor
                 if start_dt:
-                     # Find the index of the bar closest to start_dt
-                     for idx, bar in enumerate(bars):
-                         bar_dt = datetime.fromisoformat(bar.t.replace("Z", "+00:00"))
-                         if bar_dt >= start_dt:
-                             target_end_index = idx
-                             break
-                     else:
-                         target_end_index = len(bars)
+                    for idx, bar in enumerate(bars):
+                        bar_dt = datetime.fromisoformat(bar.t.replace("Z", "+00:00"))
+                        if bar_dt >= start_dt:
+                            target_end_index = idx
+                            break
+                    else:
+                        target_end_index = len(bars)
                 
-                end = target_end_index
-                start_i = max(0, end - 200) # Show 200 bars history
+                end = min(int(target_end_index), len(bars))
+                end_by_symbol[sym] = end
+                start_i = max(0, end - 200)
                 init = bars[start_i:end]
-                
-                # Update i to continue from where init left off
-                safe_cursor = end 
-                
+
                 await ws.send_json(
                     StreamInitMessage(type="init", mode="playback", symbol=sym, bars=init, cursor=end).model_dump()
                 )
@@ -1074,7 +1378,8 @@ def create_app() -> FastAPI:
                         ).model_dump()
                     )
 
-            i = safe_cursor
+            nonempty = [v for v in end_by_symbol.values() if v > 0]
+            i = min(nonempty) if nonempty else 0
             while True:
                 any_sent = False
                 for sym, bars in bars_by_symbol.items():

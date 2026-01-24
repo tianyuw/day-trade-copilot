@@ -169,7 +169,7 @@ class SymbolSession:
                     pass
 
         if self.trade.contracts_remaining <= 0:
-            self.state = TradeState.CLOSED
+            self.state = TradeState.SCAN
             self.trade = None
             self.follow_up = FollowUpState(armed=False)
             self.watches = []

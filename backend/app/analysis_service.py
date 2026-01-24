@@ -504,6 +504,42 @@ Recent Price Action (Last 60 mins):
         except Exception:
             pass
 
+        # Check for Hard Exit (Stop Loss / Take Profit) before calling LLM
+        if position_option_quote and req.position.risk:
+            try:
+                bid = float(position_option_quote.get("bid") or 0.0)
+                sl = float(req.position.risk.stop_loss_premium or 0.0)
+                tp = float(req.position.risk.take_profit_premium or 0.0)
+                
+                decision_action = None
+                decision_reason = ""
+                
+                if sl > 0 and bid > 0 and bid <= sl:
+                    decision_action = "close_all"
+                    decision_reason = f"Hard Stop Loss Triggered: Current Bid ({bid:.2f}) <= Stop Loss ({sl:.2f})"
+                elif tp > 0 and bid > 0 and bid >= tp:
+                    decision_action = "close_all"
+                    decision_reason = f"Hard Take Profit Triggered: Current Bid ({bid:.2f}) >= Take Profit ({tp:.2f})"
+                
+                if decision_action:
+                    return PositionManagementResponse(
+                        trade_id=req.trade_id,
+                        analysis_id="hard_exit_rule",
+                        timestamp=req.bar_time,
+                        symbol=req.symbol,
+                        bar_time=req.bar_time,
+                        decision={
+                            "action": decision_action,
+                            "reasoning": decision_reason,
+                            "exit": {"contracts_to_close": req.position.contracts_remaining},
+                            "adjustments": None
+                        },
+                        position_option_quote=position_option_quote
+                    )
+            except Exception as e:
+                print(f"Hard exit check failed: {e}")
+                pass
+
         context_text += "\nBenchmark Context (Proxy Futures):\n"
         benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
         benchmark_alias = {"QQQ": "NQ", "SPY": "ES", "DIA": "YM", "IWM": "RTY"}

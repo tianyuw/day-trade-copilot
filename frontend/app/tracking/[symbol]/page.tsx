@@ -48,6 +48,13 @@ type MarketStatus = {
 }
 
 type DailyBar = { t: string; o: number; h: number; l: number; c: number; v?: number }
+const DEV_PLAYBACK_START_UTC = "2026-01-23T14:30:00Z"
+
+function toUtcMinuteEpoch(rfc3339: string): number | null {
+  const ms = new Date(rfc3339).getTime()
+  if (!Number.isFinite(ms)) return null
+  return Math.floor(ms / 1000 / 60) * 60
+}
 
 function formatCountdown(ms: number): string {
   const clamped = Math.max(0, ms)
@@ -97,6 +104,7 @@ export default function TrackingDetailPage() {
   const search = useSearchParams()
   const symbol = useMemo(() => String(params.symbol || "").toUpperCase(), [params.symbol])
   const analysisId = search.get("analysis_id")
+  const isDev = search.get("dev") === "true"
 
   const [bars, setBars] = useState<any[]>([])
   const [prevClose, setPrevClose] = useState<number | null>(null)
@@ -113,6 +121,34 @@ export default function TrackingDetailPage() {
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
+  const analysisMarkerByMinuteRef = useRef<Map<number, "green" | "red">>(new Map())
+
+  const recordAnalysisMarker = (ts: string, payload: any) => {
+    const minute = toUtcMinuteEpoch(ts)
+    if (minute == null) return
+
+    const action = String(payload?.action ?? "")
+    const wc = payload?.watch_condition
+    const dir = typeof wc === "object" && wc ? String(wc.direction ?? "") : ""
+    const color: "green" | "red" =
+      action === "buy_long" ? "green" : action === "buy_short" ? "red" : dir === "below" ? "red" : "green"
+    analysisMarkerByMinuteRef.current.set(minute, color)
+  }
+
+  const applyMarkersToBars = (barsIn: any[]) => {
+    if (!Array.isArray(barsIn) || barsIn.length === 0) return barsIn
+    const markers = analysisMarkerByMinuteRef.current
+    if (markers.size === 0) return barsIn
+    return barsIn.map((b) => {
+      const t = typeof b?.t === "string" ? b.t : ""
+      const minute = t ? toUtcMinuteEpoch(t) : null
+      if (minute == null) return b
+      const color = markers.get(minute)
+      if (!color) return b
+      if (b?.ui_marker) return b
+      return { ...b, ui_marker: { color, kind: "analysis" } }
+    })
+  }
 
   const baseHttp = useMemo(() => {
     if (typeof window === "undefined") return ""
@@ -182,7 +218,11 @@ export default function TrackingDetailPage() {
         const positions: any[] = Array.isArray(data?.positions) ? data.positions : []
         const items: Array<{ ts: string; kind: "analysis" | "position"; payload: any }> = []
         for (const a of analysis) {
-          if (a && typeof a === "object") items.push({ ts: String(a.timestamp ?? ""), kind: "analysis", payload: a })
+          if (a && typeof a === "object") {
+            const ts = String(a.bar_time ?? a.timestamp ?? "")
+            if (ts) recordAnalysisMarker(ts, a)
+            items.push({ ts: String(a.timestamp ?? ""), kind: "analysis", payload: a })
+          }
         }
         for (const p of positions) {
           if (p && typeof p === "object") items.push({ ts: String(p.timestamp ?? p.bar_time ?? ""), kind: "position", payload: p })
@@ -203,6 +243,7 @@ export default function TrackingDetailPage() {
           })
           return [...base, ...mapped]
         })
+        setBars((prev) => applyMarkersToBars(prev))
       } catch {}
     }
 
@@ -301,7 +342,7 @@ export default function TrackingDetailPage() {
 
     if (!symbol) return
     if (!market) return
-    if (market?.session === "closed") {
+    if (market?.session === "closed" && !isDev) {
       setWsStatus("closed")
       setAiMessages((prev) => {
         const last = prev[prev.length - 1]
@@ -321,7 +362,12 @@ export default function TrackingDetailPage() {
     intentionalCloseRef.current = false
     setWsStatus("connecting")
 
-    const url = `${baseWs}/ws/realtime?symbols=${encodeURIComponent(symbol)}&analyze=true`
+    let url = ""
+    if (isDev) {
+      url = `${baseWs}/ws/playback?symbols=${encodeURIComponent(symbol)}&start=${encodeURIComponent(DEV_PLAYBACK_START_UTC)}&speed=1.0&flow=timer`
+    } else {
+      url = `${baseWs}/ws/realtime?symbols=${encodeURIComponent(symbol)}&analyze=true`
+    }
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -349,12 +395,15 @@ export default function TrackingDetailPage() {
       }
 
       if (msg.type === "init") {
-        if (msg.symbol === symbol) setBars(msg.bars || [])
+        if (msg.symbol === symbol) setBars(applyMarkersToBars(msg.bars || []))
       } else if (msg.type === "bar") {
-        if (msg.symbol === symbol) setBars((prev) => [...prev, msg.bar].slice(-1000))
+        if (msg.symbol === symbol) setBars((prev) => applyMarkersToBars([...prev, msg.bar].slice(-1000)))
       } else if (msg.type === "analysis") {
         if (msg.symbol === symbol) {
           const res = msg.result as AnalysisResult
+          const ts = String((res as any)?.bar_time ?? res?.timestamp ?? "")
+          if (ts) recordAnalysisMarker(ts, res)
+          setBars((prev) => applyMarkersToBars(prev))
           setAiMessages((prev) => [
             ...prev,
             { role: "ai", content: res, time: formatPSTFromRFC3339(res?.timestamp ?? new Date().toISOString()), type: "analysis" },
@@ -473,7 +522,7 @@ export default function TrackingDetailPage() {
                   wsStatus === "open" ? "bg-emerald-400" : wsStatus === "connecting" ? "bg-cyan-400" : wsStatus === "error" ? "bg-red-400" : "bg-white/30",
                 )}
               />
-              {wsStatus === "open" ? "Realtime" : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
+              {wsStatus === "open" ? (isDev ? "Replaying" : "Realtime") : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
             </div>
           </div>
         </div>
@@ -524,11 +573,6 @@ export default function TrackingDetailPage() {
             ) : null}
 
             <div className="relative flex-1 rounded-3xl bg-black/40 shadow-neo ring-1 ring-white/10 backdrop-blur-md overflow-hidden p-1">
-              {market?.session === "regular" && (
-                <div className="absolute left-4 top-4 z-20 rounded-md bg-emerald-500/15 px-2 py-1 text-[10px] font-black uppercase tracking-wider text-emerald-200 ring-1 ring-emerald-500/40">
-                  LIVE
-                </div>
-              )}
               <CandleCard
                 symbol={symbol}
                 bars={bars}
