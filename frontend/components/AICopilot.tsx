@@ -4,16 +4,19 @@ import { useEffect, useRef } from "react"
 import { cn } from "./cn"
 
 type AnalysisResult = {
+  analysis_id: string
+  timestamp: string
+  symbol: string
   action: "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet"
   confidence: number
   reasoning: string
-  pattern_name?: string
-  breakout_price?: number
+  pattern_name?: string | null
+  breakout_price?: number | null
   watch_condition?: {
     trigger_price: number
     direction: "above" | "below"
     expiry_minutes: number
-  }
+  } | null
   trade_plan?: {
     trade_id: string
     direction: "long" | "short"
@@ -21,8 +24,8 @@ type AnalysisResult = {
     contracts: number
     risk?: { stop_loss_premium: number; time_stop_minutes: number }
     take_profit_premium?: number
+    option_symbol?: string | null
   } | null
-  entry?: { option_symbol?: string | null } | null
 }
 
 export type ChatMessage = {
@@ -30,6 +33,7 @@ export type ChatMessage = {
   content: string | AnalysisResult
   time: string
   type?: "analysis" | "text"
+  trigger_reason?: "quant_signal" | "follow_up" | "watch_condition" | "position_management"
 }
 
 export function AICopilot({ 
@@ -40,6 +44,56 @@ export function AICopilot({
   messages: ChatMessage[]
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  const triggerLabel = (r: ChatMessage["trigger_reason"] | undefined) => {
+    if (!r) return null
+    if (r === "quant_signal") return "quant signal"
+    if (r === "follow_up") return "follow up"
+    if (r === "watch_condition") return "watch condition"
+    if (r === "position_management") return "position management"
+    return null
+  }
+
+  type MetaValue = string | number | null | undefined
+
+  const metaLabels: Record<string, string> = {
+    underlying_symbol: "Underlying Symbol",
+    option_symbol: "Option Symbol",
+    underlying_price: "Underlying Price",
+    option_price: "Option Price",
+    contracts: "Contracts",
+    direction: "Direction",
+    option: "Option",
+    stop_loss: "Stop Loss",
+    take_profit: "Take Profit",
+    time_stop_minutes: "Time Stop",
+    trade_id: "Trade ID",
+  }
+
+  const formatMetaValue = (key: string, value: MetaValue) => {
+    if (value == null) return "N/A"
+    const raw = String(value)
+    if (!raw || raw === "N/A") return "N/A"
+    if (key === "direction") return raw.toUpperCase()
+    if (key === "time_stop_minutes") return `${raw}m`
+    return raw
+  }
+
+  const renderMetaChips = (meta: Record<string, MetaValue>, keys: string[]) => {
+    return (
+      <div className="mb-3 flex flex-wrap gap-2">
+        {keys.map((k) => (
+          <div
+            key={k}
+            className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10"
+          >
+            <span className="mr-1 opacity-50">{(metaLabels[k] ?? k) + ":"}</span>
+            {formatMetaValue(k, meta[k])}
+          </div>
+        ))}
+      </div>
+    )
+  }
 
   const renderPositionMgmtCard = (raw: string) => {
     const lines = raw.split("\n")
@@ -62,16 +116,47 @@ export function AICopilot({
     const kv: Record<string, string> = {}
     for (const p of parsed) kv[p.key] = p.value
 
+    const pick = (...keys: string[]) => {
+      for (const k of keys) {
+        const v = kv[k]
+        if (v && v !== "N/A") return v
+      }
+      return null
+    }
+
+    const pmMeta: Record<string, MetaValue> = {
+      underlying_symbol: pick("underlying_symbol") ?? symbol,
+      option_symbol: pick("option_symbol"),
+      underlying_price: pick("underlying_price", "last_px"),
+      option_price: pick("option_price", "option_premium"),
+      contracts: pick("contracts", "contracts_to_close"),
+      direction: pick("direction"),
+      option: pick("option"),
+      stop_loss: pick("stop_loss", "stop_loss_premium", "new_stop"),
+      take_profit: pick("take_profit", "take_profit_premium", "new_tp"),
+      time_stop_minutes: pick("time_stop_minutes", "new_time_stop"),
+    }
+
     const knownKeys = new Set([
-      "last_px",
-      "option_premium",
+      "underlying_symbol",
+      "option_symbol",
+      "underlying_price",
+      "option_price",
       "contracts",
+      "contracts_to_close",
       "direction",
       "option",
-      "option_symbol",
+      "stop_loss",
       "stop_loss_premium",
+      "new_stop",
+      "take_profit",
       "take_profit_premium",
+      "new_tp",
       "time_stop_minutes",
+      "contracts_to_close",
+      "new_time_stop",
+      "last_px",
+      "option_premium",
     ])
     const extraMeta = meta.filter((m) => {
       const idx = m.indexOf("=")
@@ -79,22 +164,6 @@ export function AICopilot({
       const k = m.slice(0, idx).trim()
       return !knownKeys.has(k)
     })
-
-    const lastPx = kv.last_px
-    const optionPremium = kv.option_premium
-    const contracts = kv.contracts
-    const direction = kv.direction ? kv.direction.toUpperCase() : ""
-    const option = kv.option
-    const optionSymbol = kv.option_symbol
-    const sl = kv.stop_loss_premium
-    const tp = kv.take_profit_premium
-    const tstop = kv.time_stop_minutes
-    const riskLineParts = [
-      sl ? `SL ${sl}` : null,
-      tp ? `TP ${tp}` : null,
-      tstop ? `T ${tstop}m` : null,
-    ].filter(Boolean) as string[]
-    const riskLine = riskLineParts.length ? riskLineParts.join(" · ") : ""
 
     const decisionClass = cn(
       "px-3 py-1 rounded-lg text-xs font-bold uppercase tracking-wider ring-1",
@@ -113,42 +182,23 @@ export function AICopilot({
           <div className="flex items-center gap-2 min-w-0">
             <div className={decisionClass}>{decision.replace(/_/g, " ")}</div>
             <div className="px-3 py-1 rounded-lg text-xs font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-200 ring-1 ring-indigo-500/30">
-              position mgmt
+              trigger: position management
             </div>
           </div>
           <div className="text-xs font-mono text-white/40" />
         </div>
-
-        <div className="mb-3 flex flex-wrap gap-2">
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Last Px:</span>
-            {lastPx || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Option Px:</span>
-            {optionPremium || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Contracts:</span>
-            {contracts || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Dir:</span>
-            {direction || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Option:</span>
-            {option || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Symbol:</span>
-            {optionSymbol || "N/A"}
-          </div>
-          <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-            <span className="mr-1 opacity-50">Risk:</span>
-            {riskLine || "N/A"}
-          </div>
-        </div>
+        {renderMetaChips(pmMeta, [
+          "underlying_symbol",
+          "underlying_price",
+          "option_price",
+          "contracts",
+          "direction",
+          "option",
+          "option_symbol",
+          "stop_loss",
+          "take_profit",
+          "time_stop_minutes",
+        ])}
 
         {reasoning ? (
           <p className="text-sm text-white/80 leading-relaxed">{reasoning}</p>
@@ -225,8 +275,15 @@ export function AICopilot({
                         )}>
                             {msg.content.action.replace(/_/g, " ")}
                         </div>
-                        <div className="text-xs font-mono text-white/40">
-                            Conf: {(msg.content.confidence * 100).toFixed(0)}%
+                        <div className="flex items-center gap-2">
+                          {triggerLabel(msg.trigger_reason) ? (
+                            <div className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-200 ring-1 ring-indigo-500/30">
+                              trigger: {triggerLabel(msg.trigger_reason)}
+                            </div>
+                          ) : null}
+                          <div className="text-xs font-mono text-white/40">
+                              Conf: {(msg.content.confidence * 100).toFixed(0)}%
+                          </div>
                         </div>
                     </div>
                     
@@ -280,38 +337,30 @@ export function AICopilot({
                             </div>
 
                             <div className="mt-2 flex flex-wrap gap-2">
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">trade_id:</span>
-                                    {msg.content.trade_plan.trade_id}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">dir:</span>
-                                    {msg.content.trade_plan.direction.toUpperCase()}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">contracts:</span>
-                                    {msg.content.trade_plan.contracts}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">option:</span>
-                                    {msg.content.trade_plan.option.right} {msg.content.trade_plan.option.expiration} {msg.content.trade_plan.option.strike}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">sl:</span>
-                                    {msg.content.trade_plan.risk?.stop_loss_premium ?? "N/A"}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">tp:</span>
-                                    {msg.content.trade_plan.take_profit_premium ?? "N/A"}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">t:</span>
-                                    {(msg.content.trade_plan.risk?.time_stop_minutes ?? "N/A")}{msg.content.trade_plan.risk?.time_stop_minutes != null ? "m" : ""}
-                                </div>
-                                <div className="inline-flex items-center rounded-md bg-white/5 px-2 py-1 text-[10px] font-medium text-white/70 ring-1 ring-white/10">
-                                    <span className="mr-1 opacity-50">option_symbol:</span>
-                                    {msg.content.entry?.option_symbol ?? "N/A"}
-                                </div>
+                                {renderMetaChips(
+                                  {
+                                    trade_id: msg.content.trade_plan.trade_id,
+                                    underlying_symbol: msg.content.symbol,
+                                    direction: msg.content.trade_plan.direction,
+                                    contracts: msg.content.trade_plan.contracts,
+                                    option: `${String(msg.content.trade_plan.option.right).toUpperCase()} ${msg.content.trade_plan.option.expiration} ${msg.content.trade_plan.option.strike}`,
+                                    stop_loss: msg.content.trade_plan.risk?.stop_loss_premium,
+                                    take_profit: msg.content.trade_plan.take_profit_premium,
+                                    time_stop_minutes: msg.content.trade_plan.risk?.time_stop_minutes,
+                                    option_symbol: msg.content.trade_plan.option_symbol ?? null,
+                                  },
+                                  [
+                                    "trade_id",
+                                    "underlying_symbol",
+                                    "direction",
+                                    "contracts",
+                                    "option",
+                                    "option_symbol",
+                                    "stop_loss",
+                                    "take_profit",
+                                    "time_stop_minutes",
+                                  ],
+                                )}
                             </div>
                         </div>
                     )}

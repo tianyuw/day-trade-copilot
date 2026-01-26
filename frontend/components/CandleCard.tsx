@@ -24,7 +24,7 @@ type Bar = {
   v?: number
   ui_marker?: {
     color: "green" | "red"
-    kind: "follow_up" | "watch" | "analysis"
+    kind: "analysis"
   }
   indicators?: {
     z_score_diff?: number
@@ -36,14 +36,19 @@ function toEpochSeconds(rfc3339: string): number {
   return Math.floor(new Date(rfc3339).getTime() / 1000)
 }
 
-function pad2(n: number): string {
-  return String(n).padStart(2, "0")
-}
+const ptTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/Los_Angeles",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+})
 
-function formatPSTFromUtcSeconds(utcSeconds: number): string {
-  const pstMs = utcSeconds * 1000 - 8 * 60 * 60 * 1000
-  const d = new Date(pstMs)
-  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+function formatPTFromUtcSeconds(utcSeconds: number): string {
+  try {
+    return ptTimeFormatter.format(new Date(utcSeconds * 1000))
+  } catch {
+    return ""
+  }
 }
 
 function toUtcSeconds(time: Time): number | null {
@@ -85,7 +90,7 @@ function barsToMarkers(bars: Bar[]): SeriesMarker<Time>[] {
     const time = toEpochSeconds(b.t)
     if (!Number.isFinite(time)) continue
 
-    if (b.ui_marker) {
+    if (b.ui_marker?.kind === "analysis") {
       byTime.set(time, {
         time: time as Time,
         position: "aboveBar",
@@ -94,18 +99,6 @@ function barsToMarkers(bars: Bar[]): SeriesMarker<Time>[] {
         size: 1,
       })
       continue
-    }
-
-    if (!b.indicators?.signal) continue
-    const isLong = b.indicators.signal === "long"
-    if (!byTime.has(time)) {
-      byTime.set(time, {
-        time: time as Time,
-        position: "aboveBar",
-        color: isLong ? "#22c55e" : "#ef4444",
-        shape: "circle",
-        size: 1,
-      })
     }
   }
 
@@ -294,7 +287,14 @@ export function MiniCandleChart({
     if (!seriesRef.current) return
     seriesRef.current.setData(candles)
     seriesRef.current.setMarkers(markers)
-    chartRef.current?.timeScale().fitContent()
+    if (chartRef.current && candles.length > 0) {
+      chartRef.current.timeScale().setVisibleRange({
+        from: candles[0]!.time,
+        to: candles[candles.length - 1]!.time,
+      })
+    } else {
+      chartRef.current?.timeScale().fitContent()
+    }
   }, [candles, markers])
 
   useEffect(() => {
@@ -400,10 +400,13 @@ export function CandleCard({
         borderColor: "rgba(255,255,255,.08)",
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 0,
+        fixLeftEdge: true,
+        fixRightEdge: true,
         tickMarkFormatter: (time: Time) => {
           const utcSeconds = toUtcSeconds(time)
           if (utcSeconds == null) return ""
-          return formatPSTFromUtcSeconds(utcSeconds)
+          return formatPTFromUtcSeconds(utcSeconds)
         },
       },
       localization: {
@@ -411,7 +414,7 @@ export function CandleCard({
         timeFormatter: (time: Time) => {
           const utcSeconds = toUtcSeconds(time)
           if (utcSeconds == null) return ""
-          return formatPSTFromUtcSeconds(utcSeconds)
+          return formatPTFromUtcSeconds(utcSeconds)
         },
       },
     })
@@ -458,10 +461,13 @@ export function CandleCard({
         borderColor: "rgba(255,255,255,.08)",
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 0,
+        fixLeftEdge: true,
+        fixRightEdge: true,
         tickMarkFormatter: (time: Time) => {
           const utcSeconds = toUtcSeconds(time)
           if (utcSeconds == null) return ""
-          return formatPSTFromUtcSeconds(utcSeconds)
+          return formatPTFromUtcSeconds(utcSeconds)
         },
       },
       localization: {
@@ -469,7 +475,7 @@ export function CandleCard({
         timeFormatter: (time: Time) => {
           const utcSeconds = toUtcSeconds(time)
           if (utcSeconds == null) return ""
-          return formatPSTFromUtcSeconds(utcSeconds)
+          return formatPTFromUtcSeconds(utcSeconds)
         },
       },
       rightPriceScale: {
@@ -719,20 +725,6 @@ export function CandleCard({
     ? ((currentPrice - prevClose) / prevClose * 100) 
     : null
 
-  const xAxisLabels = useMemo(() => {
-    if (!candles.length) return null
-    const first = toUtcSeconds(candles[0].time)
-    const last = toUtcSeconds(candles[candles.length - 1].time)
-    const mid = toUtcSeconds(candles[Math.floor(candles.length / 2)].time)
-    const focus = overlayData?.time != null ? toUtcSeconds(overlayData.time as any) : null
-    return {
-      left: first != null ? formatPSTFromUtcSeconds(first) : "",
-      mid: (focus ?? mid) != null ? formatPSTFromUtcSeconds((focus ?? mid) as number) : "",
-      right: last != null ? formatPSTFromUtcSeconds(last) : "",
-    }
-  }, [candles, overlayData?.time])
-
-
   const badge = status === "hot" ? "🔥 AI" : status === "watch" ? "⚡ Quant" : ""
 
   return (
@@ -743,7 +735,7 @@ export function CandleCard({
         className,
       )}
     >
-      <div className="absolute inset-0 bg-neon-radial opacity-70" />
+      <div className="absolute inset-0 bg-neon-radial opacity-70 pointer-events-none" />
       
       {isAnalyzing && (
         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-300">
@@ -822,16 +814,9 @@ export function CandleCard({
 
       </div>
 
-      <div className="relative mt-3 h-full w-full flex-1 min-h-[400px]">
-        <div ref={containerRef} className="h-full w-full" />
+      <div className="relative mt-3 w-full flex-1 min-h-0">
+        <div ref={containerRef} className="absolute inset-0" />
       </div>
-      {xAxisLabels && (
-        <div className="mt-2 flex items-center justify-between text-xs font-mono text-white/40">
-          <div>{xAxisLabels.left}</div>
-          <div className="text-white/55">{xAxisLabels.mid}</div>
-          <div>{xAxisLabels.right}</div>
-        </div>
-      )}
     </div>
   )
 }

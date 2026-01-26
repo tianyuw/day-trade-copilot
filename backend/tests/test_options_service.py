@@ -1,23 +1,34 @@
-import asyncio
-import os
-import sys
+import re
+from datetime import datetime, timedelta, timezone
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+import pytest
 
-from app.options_service import OptionChainService
+from app.analysis_service import AnalysisService
+from app.schemas import AlpacaBar, LLMAnalysisRequest
+
+
+class _StubLLMBackend:
+    model_name = "stub"
+
+    def __init__(self) -> None:
+        self.last_system_prompt: str | None = None
+        self.last_user_content_text: str | None = None
+
+    async def analyze_chart(self, *, system_prompt: str, user_content_text: str, chart_image_base64: str) -> str:
+        self.last_system_prompt = system_prompt
+        self.last_user_content_text = user_content_text
+        return '{"action":"ignore","confidence":0.5,"reasoning":"stub"}'
 
 
 class FakeAlpaca:
     def __init__(self) -> None:
-        self.contracts_payload = {
-            "option_contracts": [
-                {"symbol": "META240123C0063000", "expiration_date": "2026-01-23", "type": "call", "strike_price": 630.0, "tradable": True, "status": "active"},
-                {"symbol": "META240123P0063000", "expiration_date": "2026-01-23", "type": "put", "strike_price": 630.0, "tradable": True, "status": "active"},
-                {"symbol": "META240130C0064000", "expiration_date": "2026-01-30", "type": "call", "strike_price": 640.0, "tradable": True, "status": "active"},
-            ],
-            "page_token": None,
-        }
-        self.chain_snapshots = {
+        self._contracts = [
+            {"symbol": "META240123C0063000", "expiration_date": "2026-01-23", "type": "call", "strike_price": 630.0, "tradable": True, "status": "active"},
+            {"symbol": "META240123P0063000", "expiration_date": "2026-01-23", "type": "put", "strike_price": 630.0, "tradable": True, "status": "active"},
+            {"symbol": "META240130C0064000", "expiration_date": "2026-01-30", "type": "call", "strike_price": 640.0, "tradable": True, "status": "active"},
+        ]
+
+        self._chain_snapshots = {
             "META240123C0063000": {
                 "latestQuote": {"bp": 3.0, "ap": 3.2, "t": "2026-01-22T19:15:00Z"},
                 "impliedVolatility": 0.45,
@@ -29,16 +40,28 @@ class FakeAlpaca:
                 "impliedVolatility": 0.52,
             },
         }
-        self.latest_quotes = {
+
+        self._latest_quotes = {
             "META240123C0063000": {"bp": 3.05, "ap": 3.25, "t": "2026-01-22T19:16:00Z"},
             "META240123P0063000": {"bp": 2.55, "ap": 2.75, "t": "2026-01-22T19:16:00Z"},
         }
 
     async def get_option_contracts(self, underlying_symbols, **kwargs):
-        return self.contracts_payload
+        gte = kwargs.get("expiration_date_gte")
+        lte = kwargs.get("expiration_date_lte")
+
+        def in_range(exp: str) -> bool:
+            if gte and exp < str(gte):
+                return False
+            if lte and exp > str(lte):
+                return False
+            return True
+
+        contracts = [c for c in self._contracts if in_range(str(c.get("expiration_date")))]
+        return {"option_contracts": contracts, "page_token": None}
 
     async def get_option_chain_snapshots(self, underlying_or_symbols, feed=None, page_token=None):
-        return {"snapshots": self.chain_snapshots, "next_page_token": None}
+        return {"snapshots": self._chain_snapshots, "next_page_token": None}
 
     async def get_option_quotes(self, symbols, start=None, end=None, limit=1000):
         out = {}
@@ -49,66 +72,71 @@ class FakeAlpaca:
             ]
         return out
 
-    async def get_option_bars(self, symbols, timeframe="1Min", start=None, end=None, limit=100):
-        out = {}
-        for s in symbols:
-            out[s] = [
-                {"t": "2026-01-22T19:10:00Z", "o": 2.9, "h": 3.0, "l": 2.8, "c": 2.95, "v": 10},
-                {"t": "2026-01-22T19:15:00Z", "o": 3.0, "h": 3.2, "l": 3.0, "c": 3.1, "v": 20},
-            ]
-        return out
-
     async def get_bars(self, symbols, timeframe="1Min", start=None, end=None, limit=200):
-        # Only used for underlying price; use a simple constant series
-        from app.schemas import AlpacaBar
+        sym = str(symbols[0]).upper()
+        if timeframe == "1Day":
+            base = datetime(2025, 11, 1, tzinfo=timezone.utc)
+            bars = []
+            for i in range(60):
+                t = (base + timedelta(days=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                px = 600.0 + i * 0.1
+                bars.append(AlpacaBar(t=t, o=px, h=px + 1, l=px - 1, c=px, v=100000))
+            return {sym: bars}
 
-        sym = symbols[0]
-        return {sym: [AlpacaBar(t="2026-01-22T19:15:00Z", o=630.0, h=631.0, l=629.0, c=630.5, v=1000)]}
+        end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00")) if end else datetime(2026, 1, 22, 19, 15, tzinfo=timezone.utc)
+        start_dt = end_dt - timedelta(minutes=300)
+        bars = []
+        cur = start_dt
+        px = 630.0
+        while cur <= end_dt:
+            t = cur.strftime("%Y-%m-%dT%H:%M:%SZ")
+            bars.append(AlpacaBar(t=t, o=px, h=px + 0.5, l=px - 0.5, c=px + 0.1, v=1000))
+            cur += timedelta(minutes=1)
+        return {sym: bars[-limit:]}
 
     async def get_snapshots(self, symbols):
-        sym = symbols[0]
-        return {
-            sym: {
-                "latestQuote": {"bp": 630.0, "ap": 631.0},
-            }
-        }
+        sym = str(symbols[0]).upper()
+        return {sym: {"latestQuote": {"bp": 630.0, "ap": 631.0}}}
 
     async def get_option_latest_quotes(self, symbols, feed=None):
         out = {}
         for s in symbols:
-            if s in self.latest_quotes:
-                out[s] = self.latest_quotes[s]
+            if s in self._latest_quotes:
+                out[s] = self._latest_quotes[s]
         return out
 
 
-async def test_get_chain_realtime():
-    client = OptionChainService(FakeAlpaca())
-    chain = await client.get_chain_realtime("META", strikes_around_atm=1)
-    assert chain["expiration"] == "2026-01-23"
-    items = chain["items"]
-    assert any(it["symbol"] == "META240123C0063000" for it in items)
-    call = next(it for it in items if it["symbol"] == "META240123C0063000")
-    assert call["quote"]["bid"] == 3.05
-    assert call["quote"]["ask"] == 3.25
-    print("test_get_chain_realtime passed")
+def _extract_nearest_expiration(user_content_text: str) -> str:
+    m = re.search(r"Option Chain \(Nearest Expiration: (\d{4}-\d{2}-\d{2})", user_content_text)
+    assert m, "missing Option Chain (Nearest Expiration: ...) in user prompt"
+    return m.group(1)
 
 
-async def test_get_chain_asof_with_bars():
-    client = OptionChainService(FakeAlpaca())
-    asof = "2026-01-22T19:15:00Z"
-    chain = await client.get_chain_asof("META", asof=asof, strikes_around_atm=1, include_bars_minutes=10)
-    items = chain["items"]
-    call = next(it for it in items if it["symbol"] == "META240123C0063000")
-    assert abs(call["asof_price"] - 3.1) < 1e-6
-    assert "bars_1m" in call and len(call["bars_1m"]) >= 2
-    print("test_get_chain_asof_with_bars passed")
+@pytest.mark.asyncio
+async def test_prompt_includes_option_chain_realtime():
+    alpaca = FakeAlpaca()
+    service = AnalysisService(alpaca)
+    stub = _StubLLMBackend()
+    service.llm_client.client = stub
+
+    req = LLMAnalysisRequest(symbol="META", current_time="2026-01-22T19:15:00Z", mode="realtime")
+    await service.analyze_signal(req)
+
+    assert stub.last_user_content_text is not None
+    exp = _extract_nearest_expiration(stub.last_user_content_text)
+    assert exp == "2026-01-23"
 
 
-async def main():
-    await test_get_chain_realtime()
-    await test_get_chain_asof_with_bars()
-    print("All OptionChainService tests passed.")
+@pytest.mark.asyncio
+async def test_prompt_includes_option_chain_playback_nearest_expiration():
+    alpaca = FakeAlpaca()
+    service = AnalysisService(alpaca)
+    stub = _StubLLMBackend()
+    service.llm_client.client = stub
 
+    req = LLMAnalysisRequest(symbol="META", current_time="2026-01-22T19:15:00Z", mode="playback")
+    await service.analyze_signal(req)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    assert stub.last_user_content_text is not None
+    exp = _extract_nearest_expiration(stub.last_user_content_text)
+    assert exp == "2026-01-23"

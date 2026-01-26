@@ -1,0 +1,25 @@
+[
+  {
+    "id": "meta_0123_0930_test",
+    "description": "META 2026-01-23 09:30（PST）区间波动高点，不应直接 buy_long。",
+    "symbol": "META",
+    "time_pst": "2026-01-23 09:30",
+    "mode": "playback",
+    "expect": { "action_not": "buy_long" }
+  },
+  {
+    "id": "meta_0123_0742_0756_any_buy_long",
+    "description": "META 2026-01-23 07:42–07:56， 接近当日高点，形成bull flag有效突破，可以buy_long, 止盈目标应为当日高点。",
+    "symbol": "META",
+    "time_range_pst": { "start": "2026-01-23 07:42", "end": "2026-01-23 07:56" },
+    "expect": { "any": { "action_is": "buy_long" } }
+  },
+  {
+    "id": "meta_0123_1121_day_high_test",
+    "description": "META 2026-01-23 11:21（PST）测试日高点收阻回落。",
+    "symbol": "META",
+    "time_pst": "2026-01-23 11:21",
+    "mode": "playback",
+    "expect": { "any": { "action_not": "buy_long" } }
+  }
+]

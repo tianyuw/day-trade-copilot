@@ -29,6 +29,24 @@ from .schemas import (
     TradingSettings,
 )
 from .trade_session import ActiveTrade, SymbolSession, TradeState, _to_epoch_seconds
+from .intraday_bootstrap import (
+    DEFAULT_CHART_WINDOW_MINUTES,
+    DEFAULT_PLAYBACK_FORWARD_CHUNK_MINUTES,
+    DEFAULT_PLAYBACK_PREFETCH_LOW_WATERMARK_MINUTES,
+    analysis_keep_minutes,
+    bootstrap_minutes,
+    parse_iso_z,
+    playback_initial_fetch_window,
+    to_iso_z,
+)
+from .stream_autopilot import (
+    maybe_trigger_analysis as autopilot_maybe_trigger_analysis,
+    run_analysis as autopilot_run_analysis,
+    run_manage_position as autopilot_run_manage_position,
+    send_state as autopilot_send_state,
+    to_daily_df as autopilot_to_daily_df,
+    to_intraday_df as autopilot_to_intraday_df,
+)
 from .trading_schemas import (
     CancelOrderRequest,
     ClosePositionRequest,
@@ -450,9 +468,16 @@ def create_app() -> FastAPI:
         strikes_around_atm: Annotated[int, Query(ge=0, le=50)] = 5,
         feed: Annotated[str | None, Query()] = None,
     ) -> dict:
+        if asof:
+            return await option_chain_service.get_chain_asof(
+                underlying=underlying,
+                asof=asof,
+                strikes_around_atm=strikes_around_atm,
+                options_feed=feed,
+            )
         return await option_chain_service.build_chain(
             underlying=underlying,
-            asof=asof,
+            asof=None,
             strikes_around_atm=strikes_around_atm,
             options_feed=feed,
         )
@@ -460,12 +485,14 @@ def create_app() -> FastAPI:
     @app.get("/api/options/quotes")
     async def options_quotes(
         symbols: Annotated[str, Query(min_length=1)],
+        feed: Annotated[str | None, Query()] = None,
         start: Annotated[str | None, Query()] = None,
         end: Annotated[str | None, Query()] = None,
-        limit: Annotated[int, Query(ge=1, le=10000)] = 1000,
     ) -> dict:
+        if start or end:
+            raise HTTPException(status_code=400, detail="historical option quotes are not available; use /api/options/bars or /api/options/trades")
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        quotes = await alpaca.get_option_quotes(symbol_list, start=start, end=end, limit=limit)
+        quotes = await alpaca.get_option_latest_quotes(symbol_list, feed=feed)
         return {"quotes": quotes}
 
     @app.get("/api/options/bars")
@@ -846,26 +873,97 @@ def create_app() -> FastAPI:
             s = sessions.get(sym)
             if not s:
                 return
-            in_pos = bool(s.trade and s.state == TradeState.IN_POSITION and s.trade.contracts_remaining > 0)
-            rem = s.trade.contracts_remaining if s.trade else None
-            key = (s.state.value, rem if isinstance(rem, int) else None)
-            if last_state_sent.get(sym) == key:
-                return
-            last_state_sent[sym] = key
-            await ws.send_json(
-                StreamStateMessage(
-                    type="state",
-                    mode="realtime",
-                    symbol=sym,
-                    state=s.state.value,
-                    in_position=in_pos,
-                    contracts_total=s.trade.contracts_total if s.trade else None,
-                    contracts_remaining=rem,
-                    trade_id=s.trade.trade_id if s.trade else None,
-                    option=s.trade.option if s.trade else None,
-                    option_symbol=s.trade.option_symbol if s.trade else None,
-                ).model_dump()
+            await autopilot_send_state(ws, session=s, mode="realtime", last_state_sent=last_state_sent)
+
+        async def after_analysis(llm_res: LLMAnalysisResponse, payload: dict[str, Any], option_symbol: str | None) -> None:
+            plan = payload.get("trade_plan") if isinstance(payload, dict) else None
+            trade_id = str(plan.get("trade_id")) if isinstance(plan, dict) and plan.get("trade_id") else None
+            analysis_id = str(payload.get("analysis_id") or "")
+            event_trade_id = trade_id or (f"analysis:{analysis_id}" if analysis_id else f"analysis:{payload.get('symbol')}:{payload.get('timestamp')}")
+            ledger.append_event(
+                trade_id=event_trade_id,
+                event_type="llm_analysis_result",
+                symbol=str(payload.get("symbol") or "").upper() or llm_res.symbol,
+                timestamp=str(payload.get("timestamp") or ""),
+                analysis_id=analysis_id,
+                bar_time=str(payload.get("bar_time") or payload.get("timestamp") or ""),
+                payload=payload,
             )
+            _append_analysis_history(llm_res)
+            if payload.get("action") in ("buy_long", "buy_short") and isinstance(payload.get("trade_plan"), dict):
+                plan2 = payload.get("trade_plan") or {}
+                opt = plan2.get("option") if isinstance(plan2.get("option"), dict) else {}
+                try:
+                    ledger.upsert_trade(
+                        {
+                            "trade_id": str(plan2.get("trade_id") or ""),
+                            "symbol": str(payload.get("symbol") or "").upper() or llm_res.symbol,
+                            "mode": "realtime",
+                            "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                            "state": "IN_POSITION",
+                            "option_symbol": option_symbol,
+                            "option_right": opt.get("right"),
+                            "option_expiration": opt.get("expiration"),
+                            "option_strike": opt.get("strike"),
+                            "contracts_total": plan2.get("contracts"),
+                            "contracts_remaining": plan2.get("contracts"),
+                            "entry_time": payload.get("timestamp"),
+                            "extra": {
+                                "direction": plan2.get("direction"),
+                                "risk": plan2.get("risk"),
+                                "take_profit_premium": plan2.get("take_profit_premium"),
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+
+        async def after_position(pm_res: PositionManagementResponse, pm_payload: dict[str, Any]) -> None:
+            trade_id = str(pm_payload.get("trade_id") or "")
+            analysis_id = str(pm_payload.get("analysis_id") or "")
+            ledger.append_event(
+                trade_id=trade_id,
+                event_type="position_mgmt_result",
+                symbol=str(pm_payload.get("symbol") or "").upper() or pm_res.symbol,
+                timestamp=str(pm_payload.get("timestamp") or ""),
+                analysis_id=analysis_id,
+                bar_time=str(pm_payload.get("bar_time") or pm_payload.get("timestamp") or ""),
+                payload=pm_payload,
+            )
+            _append_position_history(pm_res)
+            try:
+                s = sessions.get(str(pm_payload.get("symbol") or "").upper() or pm_res.symbol)
+                if s and s.trade:
+                    ledger.upsert_trade(
+                        {
+                            "trade_id": s.trade.trade_id,
+                            "symbol": s.symbol,
+                            "mode": "realtime",
+                            "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                            "state": "IN_POSITION",
+                            "contracts_total": s.trade.contracts_total,
+                            "contracts_remaining": s.trade.contracts_remaining,
+                            "extra": {
+                                "direction": s.trade.direction,
+                                "risk": s.trade.risk,
+                                "take_profit_premium": s.trade.risk.get("take_profit_premium"),
+                            },
+                        }
+                    )
+                else:
+                    ledger.upsert_trade(
+                        {
+                            "trade_id": trade_id,
+                            "symbol": str(pm_payload.get("symbol") or "").upper() or pm_res.symbol,
+                            "mode": "realtime",
+                            "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
+                            "state": "CLOSED",
+                            "contracts_remaining": 0,
+                            "exit_time": str(pm_payload.get("timestamp") or ""),
+                        }
+                    )
+            except Exception:
+                pass
 
         try:
             active_rows = ledger.get_active_trades(symbol_list)
@@ -945,8 +1043,12 @@ def create_app() -> FastAPI:
                     daily_bars_df[sym] = None
 
             now_utc = datetime.now(ZoneInfo("UTC"))
-            backfill_minutes = max(analysis_window_minutes + 50, 250)
-            chart_minutes = 120
+            keep_n = analysis_keep_minutes(analysis_window_minutes)
+            backfill_minutes = bootstrap_minutes(
+                analysis_window_minutes=analysis_window_minutes,
+                chart_window_minutes=DEFAULT_CHART_WINDOW_MINUTES,
+            )
+            chart_minutes = DEFAULT_CHART_WINDOW_MINUTES
             backfill_start = (now_utc - timedelta(minutes=backfill_minutes)).isoformat().replace("+00:00", "Z")
             backfill_end = now_utc.isoformat().replace("+00:00", "Z")
 
@@ -975,6 +1077,9 @@ def create_app() -> FastAPI:
             for sym in symbol_list:
                 bars = backfill.get(sym, [])
                 # Process backfill to warmup indicators
+                last_bar = None
+                last_z_res = None
+                last_final_signal = None
                 for bar in bars:
                     z_res = indicators[sym].update(float(bar.c))
                     m_res = macd_indicators[sym].update(float(bar.c))
@@ -984,9 +1089,19 @@ def create_app() -> FastAPI:
                         final_signal = 'long'
                     elif z_res.get('signal') == 'short':
                         final_signal = 'short'
-                        
+
                     bar.indicators = {**z_res, **m_res, "signal": final_signal}
                     intraday_buffers[sym].append(bar)
+                    last_bar = bar
+                    last_z_res = z_res
+                    last_final_signal = final_signal
+
+                if last_bar is not None and last_z_res is not None:
+                    first_t = bars[0].t if bars else None
+                    print(
+                        f"[QUANT] {sym} warmup {len(bars)} bars {first_t} -> {last_bar.t} | "
+                        f"LastPrice: {last_bar.c} | Z-Diff: {last_z_res.get('z_score_diff')} | Signal: {last_final_signal}"
+                    )
                 
                 init_bars = bars[-chart_minutes:] if len(bars) > chart_minutes else bars
                 await ws.send_json(
@@ -1005,13 +1120,17 @@ def create_app() -> FastAPI:
                     elif z_res.get('signal') == 'short':
                         final_signal = 'short'
                         
+                    print(f"[QUANT] {sym} {bar.t} | Price: {bar.c} | Z-Diff: {z_res.get('z_score_diff')} | Signal: {final_signal}")
+
                     bar.indicators = {**z_res, **m_res, "signal": final_signal}
                     intraday_buffers[sym].append(bar)
-                    intraday_buffers[sym] = intraday_buffers[sym][-max(analysis_window_minutes + 50, 250):]
-                await ws.send_json(StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump())
+                    intraday_buffers[sym] = intraday_buffers[sym][-keep_n:]
 
                 session = sessions.get(sym)
                 if not analyze or not session:
+                    await ws.send_json(
+                        StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump()
+                    )
                     continue
 
                 session.last_bar_time = bar.t
@@ -1020,242 +1139,64 @@ def create_app() -> FastAPI:
 
                 has_quant_signal = bool(bar.indicators and bar.indicators.get("signal"))
 
-                await send_state(sym)
-
-                async def run_analysis() -> None:
-                    async with llm_sem:
-                        session.analysis_inflight = True
-                        session.state = TradeState.AI_VERIFY
-                        await send_state(sym)
-                        intraday_slice = intraday_buffers[sym][-analysis_window_minutes:]
-                        df_intraday = pd.DataFrame([b.model_dump() for b in intraday_slice])
-                        if df_intraday.empty:
-                            return
-                        df_intraday["timestamp"] = pd.to_datetime(df_intraday["t"])
-                        df_intraday.set_index("timestamp", inplace=True)
-                        df_intraday.rename(
-                            columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"},
-                            inplace=True,
-                        )
-                        df_intraday["symbol"] = sym
-                        if "indicators" in df_intraday.columns:
-                            df_intraday.drop(columns=["indicators"], inplace=True)
-                        df_intraday.sort_index(inplace=True)
-                        analysis_req = LLMAnalysisRequest(symbol=sym, current_time=bar.t, mode="realtime")
-                        llm_res = await analysis_service.analyze_signal(
-                            analysis_req,
-                            preloaded_daily_bars=daily_bars_df.get(sym),
-                            preloaded_intraday_bars=df_intraday,
-                        )
-                        payload = llm_res.model_dump()
-                        plan = payload.get("trade_plan") if isinstance(payload, dict) else None
-                        trade_id = str(plan.get("trade_id")) if isinstance(plan, dict) and plan.get("trade_id") else None
-                        analysis_id = str(payload.get("analysis_id") or "")
-                        event_trade_id = trade_id or (f"analysis:{analysis_id}" if analysis_id else f"analysis:{sym}:{payload.get('timestamp')}")
-                        ledger.append_event(
-                            trade_id=event_trade_id,
-                            event_type="llm_analysis_result",
-                            symbol=sym,
-                            timestamp=str(payload.get("timestamp") or bar.t),
-                            analysis_id=analysis_id,
-                            bar_time=str(bar.t),
-                            payload=payload,
-                        )
-                        await ws.send_json(
-                            StreamAnalysisMessage(
-                                type="analysis",
-                                mode="realtime",
-                                symbol=sym,
-                                result=llm_res,
-                            ).model_dump()
-                        )
-                        _append_analysis_history(llm_res)
-                        session.on_analysis_result(payload)
-                        if payload.get("action") in ("buy_long", "buy_short") and isinstance(payload.get("trade_plan"), dict):
-                            plan = payload.get("trade_plan") or {}
-                            opt = plan.get("option") if isinstance(plan.get("option"), dict) else {}
-                            option_symbol: str | None = None
-                            try:
-                                exp = str(opt.get("expiration") or "")
-                                right = str(opt.get("right") or "").lower()
-                                strike = float(opt.get("strike") or 0.0)
-                                if exp and right and strike:
-                                    contracts = await option_chain_service.get_contracts(
-                                        sym,
-                                        asof_date=None,
-                                        expiration_date_gte=exp,
-                                        expiration_date_lte=exp,
-                                        limit=1000,
-                                    )
-                                    for c in contracts:
-                                        try:
-                                            if str(c.get("type") or "").lower() != right:
-                                                continue
-                                            if str(c.get("expiration_date") or "") != exp:
-                                                continue
-                                            if abs(float(c.get("strike_price") or 0.0) - strike) > 1e-6:
-                                                continue
-                                            s2 = str(c.get("symbol") or "").upper()
-                                            if s2:
-                                                option_symbol = s2
-                                                break
-                                        except Exception:
-                                            continue
-                            except Exception:
-                                option_symbol = None
-                            session.enter_from_trade_plan(payload, option_symbol=option_symbol)
-                            try:
-                                ledger.upsert_trade(
-                                    {
-                                        "trade_id": str(plan.get("trade_id") or ""),
-                                        "symbol": sym,
-                                        "mode": "realtime",
-                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
-                                        "state": "IN_POSITION",
-                                        "option_symbol": option_symbol,
-                                        "option_right": opt.get("right"),
-                                        "option_expiration": opt.get("expiration"),
-                                        "option_strike": opt.get("strike"),
-                                        "contracts_total": plan.get("contracts"),
-                                        "contracts_remaining": plan.get("contracts"),
-                                        "entry_time": payload.get("timestamp") or bar.t,
-                                        "extra": {
-                                            "direction": plan.get("direction"),
-                                            "risk": plan.get("risk"),
-                                            "take_profit_premium": plan.get("take_profit_premium"),
-                                        },
-                                    }
-                                )
-                            except Exception:
-                                pass
-                        session.analysis_inflight = False
-                        if session.state == TradeState.AI_VERIFY:
-                            session.state = TradeState.SCAN
-                        await send_state(sym)
-
-                async def run_manage() -> None:
-                    if not session.trade:
-                        return
-                    async with llm_sem:
-                        session.manage_inflight = True
-                        req_pm = PositionManagementRequest(
-                            trade_id=session.trade.trade_id,
-                            symbol=sym,
-                            bar_time=bar.t,
-                            position={
-                                "direction": session.trade.direction,
-                                "option": session.trade.option,
-                                "contracts_total": session.trade.contracts_total,
-                                "contracts_remaining": session.trade.contracts_remaining,
-                                "entry": {"time": session.trade.entry_time, "premium": session.trade.entry_premium},
-                                "risk": {
-                                    "stop_loss_premium": session.trade.risk.get("stop_loss_premium"),
-                                    "take_profit_premium": session.trade.risk.get("take_profit_premium"),
-                                    "time_stop_minutes": session.trade.risk.get("time_stop_minutes"),
-                                },
-                            },
-                            option_symbol=session.trade.option_symbol,
-                            ohlcv_1m=None,
-                        )
-                        pm_res = await analysis_service.manage_position(req_pm)
-                        pm_payload = pm_res.model_dump()
-                        ledger.append_event(
-                            trade_id=session.trade.trade_id,
-                            event_type="position_mgmt_result",
-                            symbol=sym,
-                            timestamp=str(pm_payload.get("timestamp") or bar.t),
-                            analysis_id=str(pm_payload.get("analysis_id") or ""),
-                            bar_time=str(bar.t),
-                            payload=pm_payload,
-                        )
-                        await ws.send_json(
-                            StreamPositionMessage(
-                                type="position",
-                                mode="realtime",
-                                symbol=sym,
-                                result=pm_res,
-                            ).model_dump()
-                        )
-                        _append_position_history(pm_res)
-                        session.on_position_decision(pm_res.model_dump())
-                        try:
-                            if session.trade:
-                                ledger.upsert_trade(
-                                    {
-                                        "trade_id": session.trade.trade_id,
-                                        "symbol": sym,
-                                        "mode": "realtime",
-                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
-                                        "state": "IN_POSITION",
-                                        "contracts_total": session.trade.contracts_total,
-                                        "contracts_remaining": session.trade.contracts_remaining,
-                                        "extra": {
-                                            "direction": session.trade.direction,
-                                            "risk": session.trade.risk,
-                                            "take_profit_premium": session.trade.risk.get("take_profit_premium"),
-                                        },
-                                    }
-                                )
-                            else:
-                                ledger.upsert_trade(
-                                    {
-                                        "trade_id": req_pm.trade_id,
-                                        "symbol": sym,
-                                        "mode": "realtime",
-                                        "execution": default_execution.value if auto_trade_execution_enabled else "simulated",
-                                        "state": "CLOSED",
-                                        "contracts_remaining": 0,
-                                        "exit_time": str(pm_payload.get("timestamp") or bar.t),
-                                    }
-                                )
-                        except Exception:
-                            pass
-                        session.manage_inflight = False
-                        await send_state(sym)
-
                 if session.trade and session.state == TradeState.IN_POSITION and not session.manage_inflight:
+                    await ws.send_json(
+                        StreamBarMessage(type="bar", mode="realtime", symbol=sym, bar=bar).model_dump()
+                    )
+                    await send_state(sym)
                     try:
-                        await run_manage()
+                        pm_payload = await autopilot_run_manage_position(
+                            ws,
+                            mode="realtime",
+                            sem=llm_sem,
+                            analysis_service=analysis_service,
+                            session=session,
+                            bar_time=str(bar.t),
+                            ohlcv_1m=None,
+                            last_state_sent=last_state_sent,
+                            after_position=after_position,
+                        )
                     except Exception as e:
                         print(f"Auto-PositionManage failed for {sym}: {e}")
-                    continue
-
-                if session.watches and bar.t:
-                    hit = None
-                    try:
-                        close_px = float(bar.c)
-                        for w in sorted(session.watches, key=lambda x: x.created_at_epoch_s):
-                            if w.direction == "above" and close_px >= w.trigger_price:
-                                hit = w
-                                break
-                            if w.direction == "below" and close_px <= w.trigger_price:
-                                hit = w
-                                break
-                    except Exception:
-                        hit = None
-                    if hit and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
-                        session.watches = [w for w in session.watches if w is not hit]
-                        last_analyzed_time[sym] = bar.t
-                        try:
-                            await run_analysis()
-                        except Exception as e:
-                            print(f"Auto-Analysis failed for {sym}: {e}")
+                        pm_payload = None
+                    if session.trade is not None:
                         continue
 
-                if session.state == TradeState.FOLLOW_UP_PENDING and session.follow_up.armed and bar.t:
-                    if not has_quant_signal and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
-                        session.follow_up = session.follow_up.__class__(armed=False)
-                        last_analyzed_time[sym] = bar.t
-                        try:
-                            await run_analysis()
-                        except Exception as e:
-                            print(f"Auto-Analysis failed for {sym}: {e}")
-                        continue
+                trigger_reason = autopilot_maybe_trigger_analysis(
+                    session=session,
+                    bar=bar,
+                    has_quant_signal=has_quant_signal,
+                    last_analyzed_time=last_analyzed_time,
+                )
+                await ws.send_json(
+                    StreamBarMessage(
+                        type="bar",
+                        mode="realtime",
+                        symbol=sym,
+                        analysis_trigger_reason=trigger_reason,
+                        bar=bar,
+                    ).model_dump()
+                )
+                await send_state(sym)
 
-                if has_quant_signal and not session.analysis_inflight and last_analyzed_time.get(sym) != bar.t:
-                    last_analyzed_time[sym] = bar.t
+                if trigger_reason:
+                    intraday_slice = intraday_buffers[sym][-analysis_window_minutes:]
+                    df_intraday = autopilot_to_intraday_df(intraday_slice, sym)
                     try:
-                        await run_analysis()
+                        await autopilot_run_analysis(
+                            ws,
+                            mode="realtime",
+                            sem=llm_sem,
+                            analysis_service=analysis_service,
+                            option_chain_service=option_chain_service,
+                            session=session,
+                            bar_time=str(bar.t),
+                            trigger_reason=trigger_reason,
+                            intraday_df=df_intraday,
+                            daily_df=daily_bars_df.get(sym),
+                            last_state_sent=last_state_sent,
+                            after_analysis=after_analysis,
+                        )
                     except Exception as e:
                         print(f"Auto-Analysis failed for {sym}: {e}")
         except WebSocketDisconnect:
@@ -1274,6 +1215,8 @@ def create_app() -> FastAPI:
     async def ws_playback(
         ws: WebSocket,
         symbols: str = Query(default="AAPL,MSFT,NVDA,TSLA,SPY,AMD"),
+        analyze: bool = Query(default=False),
+        analysis_window_minutes: int = Query(default=300, ge=30, le=2000),
         start: str | None = Query(default=None),
         speed: float = Query(default=1.0, ge=0.05, le=60.0),
         flow: str = Query(default="timer"),
@@ -1283,20 +1226,20 @@ def create_app() -> FastAPI:
         await ws.accept()
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
         sessions: dict[str, SymbolSession] = {sym: SymbolSession(symbol=sym, mode="playback") for sym in symbol_list}
+        last_analyzed_time: dict[str, str] = {}
+        last_state_sent: dict[str, tuple[str, int | None]] = {}
+        llm_sem = asyncio.Semaphore(2)
+        intraday_buffers: dict[str, list] = {sym: [] for sym in symbol_list}
         try:
-            warmup_minutes = 200 + 21
-            warmup_minutes = 200 + 21
-            base_cursor = 0
-            request_start = start
-            start_dt = None
-            if start:
-                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                # We need enough history for:
-                # 1. Indicator warmup (21 mins)
-                # 2. Initial visible history (200 mins)
-                warmup_start_dt = start_dt - timedelta(minutes=warmup_minutes)
-                request_start = warmup_start_dt.isoformat().replace("+00:00", "Z")
-                base_cursor = warmup_minutes
+            chart_minutes = DEFAULT_CHART_WINDOW_MINUTES
+            keep_n = analysis_keep_minutes(analysis_window_minutes)
+            request_start, request_end, effective_limit, boot = playback_initial_fetch_window(
+                start=start,
+                analysis_window_minutes=analysis_window_minutes,
+                requested_limit=limit,
+                chart_window_minutes=chart_minutes,
+            )
+            start_dt = parse_iso_z(start) if start else None
             
             # Initialize indicators with history relative to playback start
             indicators: dict[str, ZScoreMomentum] = {}
@@ -1319,13 +1262,23 @@ def create_app() -> FastAPI:
                     indicators[sym] = ZScoreMomentum([b.model_dump() for b in bars])
                     macd_indicators[sym] = MACD()
 
-            bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", start=request_start, limit=limit)
+            daily_bars_df: dict[str, pd.DataFrame | None] = {
+                sym: autopilot_to_daily_df(daily_bars.get(sym, [])) for sym in symbol_list
+            }
+
+            if request_start:
+                bars_by_symbol = await alpaca.get_bars(
+                    symbol_list,
+                    timeframe="1Min",
+                    start=request_start,
+                    end=request_end,
+                    limit=effective_limit,
+                )
+            else:
+                bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=effective_limit)
             if all(len(v) == 0 for v in bars_by_symbol.values()):
-                bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=limit)
-            
-            # Fix: cursor is an absolute index from frontend, so we shouldn't add base_cursor to it again.
-            # We use max(cursor, base_cursor) to ensure we start at least after the warmup period.
-            safe_cursor = max(cursor + 200, base_cursor)
+                bars_by_symbol = await alpaca.get_bars(symbol_list, timeframe="1Min", limit=effective_limit)
+            safe_cursor = cursor
             
             # Pre-calculate indicators for all bars
             for sym, bars in bars_by_symbol.items():
@@ -1347,105 +1300,205 @@ def create_app() -> FastAPI:
                         bar.indicators = {**z_res, **m_res, "signal": final_signal}
 
             end_by_symbol: dict[str, int] = {}
+            prefetch_inflight = False
+            forward_chunk_minutes = DEFAULT_PLAYBACK_FORWARD_CHUNK_MINUTES
+            prefetch_low_watermark = DEFAULT_PLAYBACK_PREFETCH_LOW_WATERMARK_MINUTES
+
+            async def maybe_prefetch_more(current_i: int) -> None:
+                nonlocal prefetch_inflight
+                if prefetch_inflight:
+                    return
+                remaining = [len(bars) - current_i for bars in bars_by_symbol.values()]
+                if not remaining or min(remaining) > prefetch_low_watermark:
+                    return
+                last_times: list[datetime] = []
+                for bars in bars_by_symbol.values():
+                    if bars:
+                        last_times.append(parse_iso_z(str(bars[-1].t)))
+                if not last_times:
+                    return
+
+                prefetch_inflight = True
+                try:
+                    common_start = to_iso_z(min(last_times) + timedelta(minutes=1))
+                    fetched = await alpaca.get_bars(
+                        symbol_list,
+                        timeframe="1Min",
+                        start=common_start,
+                        limit=forward_chunk_minutes,
+                    )
+                    for sym in symbol_list:
+                        existing = bars_by_symbol.get(sym, [])
+                        new_bars = fetched.get(sym, []) or []
+                        if not existing:
+                            bars_by_symbol[sym] = new_bars
+                            continue
+                        last_dt = parse_iso_z(str(existing[-1].t))
+                        for bar in new_bars:
+                            bar_dt = parse_iso_z(str(bar.t))
+                            if bar_dt <= last_dt:
+                                continue
+                            if sym in indicators:
+                                z_res = indicators[sym].update(float(bar.c))
+                                m_res = macd_indicators[sym].update(float(bar.c))
+                                final_signal = None
+                                if z_res.get("signal") == "long":
+                                    final_signal = "long"
+                                elif z_res.get("signal") == "short":
+                                    final_signal = "short"
+                                bar.indicators = {**z_res, **m_res, "signal": final_signal}
+                            existing.append(bar)
+                finally:
+                    prefetch_inflight = False
+
+            async def send_state(sym: str) -> None:
+                s = sessions.get(sym)
+                if not s:
+                    return
+                await autopilot_send_state(ws, session=s, mode="playback", last_state_sent=last_state_sent)
+
+            async def wait_for_ack(expected_i: int) -> bool:
+                try:
+                    while True:
+                        msg = await asyncio.wait_for(ws.receive_json(), timeout=60.0)
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") != "ack":
+                            continue
+                        ack_i = msg.get("i")
+                        if isinstance(ack_i, int) and ack_i == expected_i:
+                            return True
+                except asyncio.TimeoutError:
+                    return False
+
             for sym, bars in bars_by_symbol.items():
                 target_end_index = safe_cursor
                 if start_dt:
+                    last_le: int | None = None
+                    first_ge: int | None = None
                     for idx, bar in enumerate(bars):
                         bar_dt = datetime.fromisoformat(bar.t.replace("Z", "+00:00"))
-                        if bar_dt >= start_dt:
-                            target_end_index = idx
-                            break
-                    else:
+                        if bar_dt <= start_dt:
+                            last_le = idx
+                            continue
+                        first_ge = idx
+                        break
+                    anchor = last_le if last_le is not None else first_ge
+                    if anchor is None:
                         target_end_index = len(bars)
+                    else:
+                        target_end_index = max(target_end_index, anchor + 1)
                 
                 end = min(int(target_end_index), len(bars))
                 end_by_symbol[sym] = end
-                start_i = max(0, end - 200)
+                start_i = max(0, end - chart_minutes)
                 init = bars[start_i:end]
 
                 await ws.send_json(
                     StreamInitMessage(type="init", mode="playback", symbol=sym, bars=init, cursor=end).model_dump()
                 )
-                s = sessions.get(sym)
-                if s:
-                    await ws.send_json(
-                        StreamStateMessage(
-                            type="state",
-                            mode="playback",
-                            symbol=sym,
-                            state=s.state.value,
-                            in_position=False,
-                        ).model_dump()
-                    )
+                await send_state(sym)
 
             nonempty = [v for v in end_by_symbol.values() if v > 0]
             i = min(nonempty) if nonempty else 0
+            if analyze and i > 0:
+                for sym, bars in bars_by_symbol.items():
+                    start_fill = max(0, i - keep_n)
+                    intraday_buffers[sym] = list(bars[start_fill:i])
             while True:
+                await maybe_prefetch_more(i)
                 any_sent = False
                 for sym, bars in bars_by_symbol.items():
                     if i < len(bars):
                         bar = bars[i]
-                        await ws.send_json(
-                            StreamBarMessage(type="bar", mode="playback", symbol=sym, bar=bar, i=i).model_dump()
-                        )
                         any_sent = True
-                        
-                        if bar.indicators and bar.indicators.get("signal"):
-                            try:
-                                daily_list = daily_bars.get(sym, [])
-                                df_daily = pd.DataFrame([b.model_dump() for b in daily_list])
-                                if not df_daily.empty:
-                                    df_daily['timestamp'] = pd.to_datetime(df_daily['t'])
-                                    df_daily.set_index('timestamp', inplace=True)
-                                    df_daily.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-                                else:
-                                    df_daily = None
 
-                                start_slice = max(0, i - 300)
-                                intraday_slice = bars[start_slice : i+1]
-                                df_intraday = pd.DataFrame([b.model_dump() for b in intraday_slice])
-                                if not df_intraday.empty:
-                                    df_intraday['timestamp'] = pd.to_datetime(df_intraday['t'])
-                                    df_intraday.set_index('timestamp', inplace=True)
-                                    df_intraday.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
-                                    df_intraday['symbol'] = sym
-                                    if 'indicators' in df_intraday.columns:
-                                        df_intraday.drop(columns=['indicators'], inplace=True)
-                                else:
-                                    df_intraday = None
-                                
-                                if df_intraday is not None:
-                                    analysis_req = LLMAnalysisRequest(symbol=sym, current_time=bar.t, mode="playback")
-                                    llm_res = await analysis_service.analyze_signal(
-                                        analysis_req,
-                                        preloaded_daily_bars=df_daily,
-                                        preloaded_intraday_bars=df_intraday,
-                                    )
+                        if analyze:
+                            intraday_buffers[sym].append(bar)
+                            intraday_buffers[sym] = intraday_buffers[sym][-keep_n:]
+
+                            session = sessions.get(sym)
+                            if session:
+                                session.last_bar_time = str(bar.t)
+                                now_epoch = _to_epoch_seconds(str(bar.t))
+                                session.update_watches(now_epoch)
+                                has_quant_signal = bool(bar.indicators and bar.indicators.get("signal"))
+
+                                if session.trade and session.state == TradeState.IN_POSITION and not session.manage_inflight:
                                     await ws.send_json(
-                                        StreamAnalysisMessage(
-                                            type="analysis",
-                                            mode="playback",
-                                            symbol=sym,
-                                            result=llm_res,
-                                        ).model_dump()
+                                        StreamBarMessage(type="bar", mode="playback", symbol=sym, bar=bar, i=i).model_dump()
                                     )
-                                
-                            except Exception as e:
-                                print(f"Auto-Analysis failed for {sym}: {e}")
-                                pass
+                                    await send_state(sym)
+                                    try:
+                                        pm_payload = await autopilot_run_manage_position(
+                                            ws,
+                                            mode="playback",
+                                            sem=llm_sem,
+                                            analysis_service=analysis_service,
+                                            session=session,
+                                            bar_time=str(bar.t),
+                                            ohlcv_1m=None,
+                                            last_state_sent=last_state_sent,
+                                        )
+                                    except Exception as e:
+                                        print(f"Auto-PositionManage failed for {sym}: {e}")
+                                        pm_payload = None
+                                    if session.trade is not None:
+                                        continue
+
+                                trigger_reason = autopilot_maybe_trigger_analysis(
+                                    session=session,
+                                    bar=bar,
+                                    has_quant_signal=has_quant_signal,
+                                    last_analyzed_time=last_analyzed_time,
+                                )
+                                await ws.send_json(
+                                    StreamBarMessage(
+                                        type="bar",
+                                        mode="playback",
+                                        symbol=sym,
+                                        analysis_trigger_reason=trigger_reason,
+                                        bar=bar,
+                                        i=i,
+                                    ).model_dump()
+                                )
+                                await send_state(sym)
+
+                                if trigger_reason:
+                                    intraday_slice = intraday_buffers[sym][-analysis_window_minutes:]
+                                    df_intraday = autopilot_to_intraday_df(intraday_slice, sym)
+                                    try:
+                                        await autopilot_run_analysis(
+                                            ws,
+                                            mode="playback",
+                                            sem=llm_sem,
+                                            analysis_service=analysis_service,
+                                            option_chain_service=option_chain_service,
+                                            session=session,
+                                            bar_time=str(bar.t),
+                                            trigger_reason=trigger_reason,
+                                            intraday_df=df_intraday,
+                                            daily_df=daily_bars_df.get(sym),
+                                            last_state_sent=last_state_sent,
+                                        )
+                                    except Exception as e:
+                                        print(f"Auto-Analysis failed for {sym}: {e}")
+                        else:
+                            await ws.send_json(
+                                StreamBarMessage(type="bar", mode="playback", symbol=sym, bar=bar, i=i).model_dump()
+                            )
 
                 if not any_sent:
                     break
-                i += 1
                 if flow == "ack":
-                    try:
-                        msg = await asyncio.wait_for(ws.receive_json(), timeout=60.0)
-                        if isinstance(msg, dict) and msg.get("type") == "ack":
-                            pass
-                    except asyncio.TimeoutError:
-                        pass
+                    ok = await wait_for_ack(i)
+                    if not ok:
+                        await ws.send_json({"type": "error", "message": "Replay ack timeout"})
+                        await ws.close()
+                        return
                 else:
                     await asyncio.sleep(speed)
+                i += 1
             await ws.send_json(StreamDoneMessage(type="done", mode="playback", cursor=i).model_dump())
             await ws.close()
         except WebSocketDisconnect:

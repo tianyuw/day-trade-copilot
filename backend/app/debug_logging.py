@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ def write_llm_exchange(
     meta: LLMExchangeMeta,
     system_prompt: str,
     user_prompt: str,
+    chart_image_base64: str | None,
     response_raw: str | None,
     parsed_json: dict[str, Any] | None,
     error: str | None,
@@ -98,7 +100,27 @@ def write_llm_exchange(
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
+    _maybe_write_chart_image(path, chart_image_base64)
     return path
+
+
+def _maybe_write_chart_image(json_path: Path, chart_image_base64: str | None) -> None:
+    if not chart_image_base64:
+        return
+    try:
+        b64 = chart_image_base64.strip()
+        if b64.startswith("data:"):
+            comma = b64.find(",")
+            if comma != -1:
+                b64 = b64[comma + 1 :]
+        img_bytes = base64.b64decode(b64, validate=False)
+        img_path = json_path.with_suffix(".png")
+        tmp_path = img_path.with_suffix(".tmp")
+        with open(tmp_path, "wb") as f:
+            f.write(img_bytes)
+        os.replace(tmp_path, img_path)
+    except Exception:
+        return
 
 
 class Stopwatch:

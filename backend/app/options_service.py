@@ -25,21 +25,23 @@ class OptionChainService:
         self._contracts_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._contracts_ttl_seconds = 6 * 60 * 60
 
-    def _cache_key(self, underlying: str, asof_date: str | None) -> str:
+    def _cache_key(self, underlying: str, asof_date: str | None, status: str | None) -> str:
         u = str(underlying).strip().upper()
         d = str(asof_date or "").strip()
-        return f"{u}|{d}"
+        s = str(status or "").strip().lower()
+        return f"{u}|{d}|{s}"
 
     async def get_contracts(
         self,
         underlying: str,
         asof_date: str | None = None,
+        status: str | None = None,
         expiration_date_lte: str | None = None,
         expiration_date_gte: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         now = time.monotonic()
-        key = self._cache_key(underlying, asof_date)
+        key = self._cache_key(underlying, asof_date, status)
         cached = self._contracts_cache.get(key)
         if cached and cached[0] > now:
             return cached[1]
@@ -50,6 +52,7 @@ class OptionChainService:
         for _ in range(20):
             payload = await self._alpaca.get_option_contracts(
                 [under],
+                status=status,
                 expiration_date_lte=expiration_date_lte,
                 expiration_date_gte=expiration_date_gte,
                 limit=limit,
@@ -82,6 +85,13 @@ class OptionChainService:
                 asof_dt = asof_dt.replace(tzinfo=timezone.utc)
 
         asof_date = asof_dt.date().isoformat() if asof_dt else None
+        is_historical_asof = False
+        if asof_dt:
+            try:
+                is_historical_asof = asof_dt.date() < datetime.now(timezone.utc).date()
+            except Exception:
+                is_historical_asof = False
+        preferred_status = "inactive" if is_historical_asof else "active"
         expiration_gte = asof_date
         expiration_lte = None
         if asof_dt:
@@ -90,6 +100,7 @@ class OptionChainService:
         contracts = await self.get_contracts(
             under,
             asof_date=asof_date,
+            status=preferred_status,
             expiration_date_gte=expiration_gte,
             expiration_date_lte=expiration_lte,
             limit=100,
@@ -97,10 +108,11 @@ class OptionChainService:
 
         norm: list[dict[str, Any]] = []
         for c in contracts:
-            if c.get("tradable") is False:
-                continue
-            if c.get("status") and str(c.get("status")).lower() != "active":
-                continue
+            if not is_historical_asof:
+                if c.get("tradable") is False:
+                    continue
+                if c.get("status") and str(c.get("status")).lower() != "active":
+                    continue
             sym = str(c.get("symbol") or "").strip().upper()
             exp = str(c.get("expiration_date") or "").strip()
             right = str(c.get("type") or "").strip().lower()
@@ -112,6 +124,39 @@ class OptionChainService:
             except Exception:
                 continue
             norm.append({"symbol": sym, "expiration": exp, "right": right, "strike": strike})
+
+        if asof_date and not any(c.get("expiration") == asof_date for c in norm):
+            secondary_status = "active" if preferred_status == "inactive" else "inactive"
+            try:
+                more = await self.get_contracts(
+                    under,
+                    asof_date=asof_date,
+                    status=secondary_status,
+                    expiration_date_gte=expiration_gte,
+                    expiration_date_lte=expiration_lte,
+                    limit=100,
+                )
+            except Exception:
+                more = []
+            if isinstance(more, list) and more:
+                seen = {c.get("symbol") for c in norm if isinstance(c, dict)}
+                for c in more:
+                    if not isinstance(c, dict):
+                        continue
+                    sym = str(c.get("symbol") or "").strip().upper()
+                    if not sym or sym in seen:
+                        continue
+                    exp = str(c.get("expiration_date") or "").strip()
+                    right = str(c.get("type") or "").strip().lower()
+                    strike_raw = c.get("strike_price")
+                    if not exp or right not in {"call", "put"}:
+                        continue
+                    try:
+                        strike = float(strike_raw)
+                    except Exception:
+                        continue
+                    norm.append({"symbol": sym, "expiration": exp, "right": right, "strike": strike})
+                    seen.add(sym)
 
         nearest_exp = self.select_nearest_expiration(norm)
         if not nearest_exp:
@@ -148,22 +193,9 @@ class OptionChainService:
             return {"underlying": under, "asof": asof, "expiration": nearest_exp, "underlying_price": underlying_price, "items": []}
 
         symbols = [c["symbol"] for c in selected]
-        snapshots = await self._fetch_chain_snapshots_for_symbols(under, symbols, feed=options_feed)
-
-        hist_quotes: dict[str, dict[str, Any]] = {}
-        if asof_dt and symbols:
-            q_start = (asof_dt - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
-            q_end = asof_dt.isoformat().replace("+00:00", "Z")
-            tasks = [self._alpaca.get_option_quotes([sym], start=q_start, end=q_end, limit=200) for sym in symbols]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for sym, res in zip(symbols, results, strict=False):
-                if isinstance(res, Exception):
-                    continue
-                rows = res.get(sym) if isinstance(res, dict) else None
-                if isinstance(rows, list) and rows:
-                    last = rows[-1]
-                    if isinstance(last, dict):
-                        hist_quotes[sym] = last
+        snapshots: dict[str, dict[str, Any]] = {}
+        if asof_dt is None:
+            snapshots = await self._fetch_chain_snapshots_for_symbols(under, symbols, feed=options_feed)
 
         items: list[dict[str, Any]] = []
         for c in selected:
@@ -177,12 +209,6 @@ class OptionChainService:
             bid = latest_quote.get("bp") if isinstance(latest_quote, dict) else None
             ask = latest_quote.get("ap") if isinstance(latest_quote, dict) else None
             qt = latest_quote.get("t") if isinstance(latest_quote, dict) else None
-
-            if sym in hist_quotes:
-                q = hist_quotes[sym]
-                bid = q.get("bp", bid)
-                ask = q.get("ap", ask)
-                qt = q.get("t", qt)
 
             items.append(
                 {
@@ -347,7 +373,7 @@ class OptionChainService:
         *,
         strikes_around_atm: int = 5,
         options_feed: str | None = None,
-        include_bars_minutes: int = 0,
+        include_bars_minutes: int = 5,
     ) -> dict[str, Any]:
         base = await self.build_chain(
             underlying=underlying,
@@ -360,23 +386,6 @@ class OptionChainService:
         if not isinstance(items, list):
             return base
 
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            quote = it.get("quote") if isinstance(it.get("quote"), dict) else {}
-            bid = quote.get("bid")
-            ask = quote.get("ask")
-            mid: float | None = None
-            try:
-                if bid is not None and ask is not None:
-                    mid = (float(bid) + float(ask)) / 2.0
-            except Exception:
-                mid = None
-            it["asof_price"] = mid
-
-        if include_bars_minutes <= 0:
-            return base
-
         try:
             asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
             if asof_dt.tzinfo is None:
@@ -384,27 +393,48 @@ class OptionChainService:
         except Exception:
             return base
 
-        start_dt = asof_dt - timedelta(minutes=int(include_bars_minutes))
+        bars_minutes = int(include_bars_minutes) if include_bars_minutes and include_bars_minutes > 0 else 5
+        start_dt = asof_dt - timedelta(minutes=bars_minutes)
         start_iso = start_dt.isoformat().replace("+00:00", "Z")
         end_iso = asof_dt.isoformat().replace("+00:00", "Z")
+
+        symbols = [str(it.get("symbol") or "").strip().upper() for it in items if isinstance(it, dict) and str(it.get("symbol") or "").strip()]
+        if not symbols:
+            return base
+
+        try:
+            payload = await self._alpaca.get_option_bars(symbols, timeframe="1Min", start=start_iso, end=end_iso, limit=1000)
+        except Exception:
+            payload = {}
 
         for it in items:
             if not isinstance(it, dict):
                 continue
-            sym = str(it.get("symbol") or "").upper()
+            sym = str(it.get("symbol") or "").strip().upper()
             if not sym:
                 continue
-            bars = await self.get_option_bars_1m(sym, start=start_iso, end=end_iso, limit=include_bars_minutes + 5)
-            if not bars:
-                continue
-            bars_sorted = sorted(bars, key=lambda b: b.get("t", ""))
-            it["bars_1m"] = bars_sorted
-            last = bars_sorted[-1]
-            try:
-                c = last.get("c")
-                if c is not None:
-                    it["asof_price"] = float(c)
-            except Exception:
-                pass
+
+            rows = payload.get(sym) if isinstance(payload, dict) else None
+            if isinstance(rows, list) and rows:
+                rows_sorted = sorted([r for r in rows if isinstance(r, dict)], key=lambda r: str(r.get("t", "")))
+                if rows_sorted:
+                    last = rows_sorted[-1]
+                    it["asof_bar_time"] = last.get("t")
+                    try:
+                        c = last.get("c")
+                        if c is not None:
+                            it["asof_price"] = float(c)
+                    except Exception:
+                        pass
+
+            if it.get("asof_price") is None:
+                quote = it.get("quote") if isinstance(it.get("quote"), dict) else {}
+                bid = quote.get("bid")
+                ask = quote.get("ask")
+                try:
+                    if bid is not None and ask is not None:
+                        it["asof_price"] = (float(bid) + float(ask)) / 2.0
+                except Exception:
+                    pass
 
         return base

@@ -3,16 +3,20 @@
 import Link from "next/link"
 import { useParams, useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { CandleCard } from "../../../components/CandleCard"
-import { AICopilot, type ChatMessage } from "../../../components/AICopilot"
 import { cn } from "../../../components/cn"
+import { TickerConsole } from "../../../components/TickerConsole"
+import type { ChatMessage } from "../../../components/AICopilot"
+import { useAnalysisMarkers } from "../../../components/hooks/useAnalysisMarkers"
+import { useBackendBaseUrls } from "../../../components/hooks/useBackendBaseUrls"
+import { type MarketStatus, useMarketStatus } from "../../../components/hooks/useMarketStatus"
+import { usePrevClose } from "../../../components/hooks/usePrevClose"
 
-type StreamInit = { type: "init"; mode: "realtime" | "playback"; symbol: string; bars: any[]; cursor?: number }
-type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; bar: any; i?: number }
-type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
+type StreamInit = { type: "init"; mode: "realtime"; symbol: string; bars: any[]; cursor?: number }
+type StreamBar = { type: "bar"; mode: "realtime"; symbol: string; analysis_trigger_reason?: any; bar: any; i?: number }
+type StreamAnalysis = { type: "analysis"; mode: "realtime"; symbol: string; trigger_reason?: any; result: any }
 type StreamState = {
   type: "state"
-  mode: "realtime" | "playback"
+  mode: "realtime"
   symbol: string
   state: string
   in_position: boolean
@@ -22,8 +26,8 @@ type StreamState = {
   option?: { right: "call" | "put"; expiration: string; strike: number } | null
   option_symbol?: string | null
 }
-type StreamPosition = { type: "position"; mode: "realtime" | "playback"; symbol: string; result: any }
-type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
+type StreamPosition = { type: "position"; mode: "realtime"; symbol: string; trigger_reason?: any; result: any }
+type StreamDone = { type: "done"; mode: "realtime"; cursor?: number }
 type StreamError = { type: "error"; message: string }
 type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamState | StreamPosition | StreamDone | StreamError
 
@@ -39,22 +43,7 @@ type AnalysisResult = {
   watch_condition?: any
 }
 
-type MarketStatus = {
-  server_time: string
-  session: "pre_market" | "regular" | "after_hours" | "closed"
-  is_open: boolean
-  next_open: string
-  next_close: string
-}
-
 type DailyBar = { t: string; o: number; h: number; l: number; c: number; v?: number }
-const DEV_PLAYBACK_START_UTC = "2026-01-23T14:30:00Z"
-
-function toUtcMinuteEpoch(rfc3339: string): number | null {
-  const ms = new Date(rfc3339).getTime()
-  if (!Number.isFinite(ms)) return null
-  return Math.floor(ms / 1000 / 60) * 60
-}
 
 function formatCountdown(ms: number): string {
   const clamped = Math.max(0, ms)
@@ -104,61 +93,30 @@ export default function TrackingDetailPage() {
   const search = useSearchParams()
   const symbol = useMemo(() => String(params.symbol || "").toUpperCase(), [params.symbol])
   const analysisId = search.get("analysis_id")
-  const isDev = search.get("dev") === "true"
 
   const [bars, setBars] = useState<any[]>([])
-  const [prevClose, setPrevClose] = useState<number | null>(null)
-  const [market, setMarket] = useState<MarketStatus | null>(null)
   const [lastDaily, setLastDaily] = useState<DailyBar | null>(null)
+  const [prevSession, setPrevSession] = useState<{ open: number | null; close: number | null; openToClosePct: number | null } | null>(null)
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("closed")
   const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
-  const [sessionState, setSessionState] = useState<{
-    state: string
-    inPosition: boolean
-    contractsRemaining: number | null
-    contractsTotal: number | null
-  } | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
-  const analysisMarkerByMinuteRef = useRef<Map<number, "green" | "red">>(new Map())
+  const barsRef = useRef<any[]>([])
+  const lastStreamStateRef = useRef<{
+    contracts_remaining: number | null
+    option: StreamState["option"] | null
+    option_symbol: string | null
+  }>({ contracts_remaining: null, option: null, option_symbol: null })
 
-  const recordAnalysisMarker = (ts: string, payload: any) => {
-    const minute = toUtcMinuteEpoch(ts)
-    if (minute == null) return
+  const { baseHttp, baseWs } = useBackendBaseUrls()
+  const { market } = useMarketStatus(baseHttp, { enabled: !!symbol })
+  const asof = useMemo(() => (symbol ? new Date().toISOString() : null), [symbol])
+  const { prevClose } = usePrevClose(baseHttp, symbol, { asof, enabled: !!symbol })
+  const { recordAnalysisMarker, applyMarkersToBars } = useAnalysisMarkers()
 
-    const action = String(payload?.action ?? "")
-    const wc = payload?.watch_condition
-    const dir = typeof wc === "object" && wc ? String(wc.direction ?? "") : ""
-    const color: "green" | "red" =
-      action === "buy_long" ? "green" : action === "buy_short" ? "red" : dir === "below" ? "red" : "green"
-    analysisMarkerByMinuteRef.current.set(minute, color)
-  }
-
-  const applyMarkersToBars = (barsIn: any[]) => {
-    if (!Array.isArray(barsIn) || barsIn.length === 0) return barsIn
-    const markers = analysisMarkerByMinuteRef.current
-    if (markers.size === 0) return barsIn
-    return barsIn.map((b) => {
-      const t = typeof b?.t === "string" ? b.t : ""
-      const minute = t ? toUtcMinuteEpoch(t) : null
-      if (minute == null) return b
-      const color = markers.get(minute)
-      if (!color) return b
-      if (b?.ui_marker) return b
-      return { ...b, ui_marker: { color, kind: "analysis" } }
-    })
-  }
-
-  const baseHttp = useMemo(() => {
-    if (typeof window === "undefined") return ""
-    return process.env.NEXT_PUBLIC_BACKEND_API ?? `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
-  }, [])
-
-  const baseWs = useMemo(() => {
-    if (typeof window === "undefined") return ""
-    return process.env.NEXT_PUBLIC_BACKEND_WS ?? `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
-  }, [])
+  const isOffHours = useMemo(() => !!market && market.session !== "regular", [market])
+  const isOffHoursReadOnly = isOffHours
 
   const countdown = useMemo(() => {
     if (!market) return null
@@ -182,6 +140,24 @@ export default function TrackingDetailPage() {
     return ((lastPrice - prevClose) / prevClose) * 100
   }, [lastPrice, prevClose])
 
+  const headerDisplayPrice = useMemo(() => {
+    if (!isOffHoursReadOnly) return lastPrice
+    if (typeof prevSession?.close === "number") return prevSession.close
+    if (typeof lastDaily?.c === "number") return lastDaily.c
+    return lastPrice
+  }, [isOffHoursReadOnly, lastDaily?.c, lastPrice, prevSession?.close])
+
+  const headerDisplayPct = useMemo(() => {
+    if (!isOffHoursReadOnly) return headerChangePct
+    if (typeof prevSession?.open === "number" && typeof prevSession?.close === "number" && prevSession.open !== 0) {
+      return ((prevSession.close - prevSession.open) / prevSession.open) * 100
+    }
+    if (typeof lastDaily?.o === "number" && typeof lastDaily?.c === "number" && lastDaily.o !== 0) {
+      return ((lastDaily.c - lastDaily.o) / lastDaily.o) * 100
+    }
+    return null
+  }, [headerChangePct, isOffHoursReadOnly, lastDaily?.c, lastDaily?.o, prevSession?.close, prevSession?.open])
+
   const extTag = useMemo(() => {
     if (!market) return null
     if (market.session === "pre_market") return "PRE"
@@ -189,16 +165,13 @@ export default function TrackingDetailPage() {
     return null
   }, [market])
 
-  const closedSummary = useMemo(() => {
-    if (!lastDaily) return null
-    const range = Number(lastDaily.h) - Number(lastDaily.l)
-    const dayPct = lastDaily.o ? ((Number(lastDaily.c) - Number(lastDaily.o)) / Number(lastDaily.o)) * 100 : null
-    const gapPct =
-      typeof prevClose === "number" && prevClose !== 0 ? ((Number(lastDaily.o) - prevClose) / prevClose) * 100 : null
-    return { range, dayPct, gapPct }
-  }, [lastDaily, prevClose])
+  useEffect(() => {
+    barsRef.current = bars
+  }, [bars])
 
   useEffect(() => {
+    barsRef.current = []
+    lastStreamStateRef.current = { contracts_remaining: null, option: null, option_symbol: null }
     setAiMessages([
       {
         role: "system",
@@ -236,9 +209,41 @@ export default function TrackingDetailPage() {
               return { role: "ai" as const, content: it.payload, time: formatPSTFromRFC3339(it.ts), type: "analysis" as const }
             }
             const d = it.payload?.decision
-            const summaryParts = [`POSITION_MGMT: ${d?.action ?? "hold"}`, String(d?.reasoning ?? "")].filter(Boolean)
+            const pos = it.payload?.position
+            const inferredAction = d?.action ?? (pos ? "requested" : "hold")
+            const summaryParts = [`POSITION_MGMT: ${inferredAction}`, String(d?.reasoning ?? "")].filter(Boolean)
+            summaryParts.push(`underlying_symbol=${symbol}`)
+            if (typeof pos?.contracts_remaining === "number") summaryParts.push(`contracts=${pos.contracts_remaining}`)
+            if (typeof pos?.direction === "string") summaryParts.push(`direction=${pos.direction}`)
+            if (pos?.option) {
+              const right = String(pos.option?.right ?? "").toUpperCase()
+              const exp = String(pos.option?.expiration ?? "")
+              const strike = typeof pos.option?.strike === "number" ? String(pos.option.strike) : ""
+              const optLine = [right, exp, strike].filter(Boolean).join(" ")
+              if (optLine) summaryParts.push(`option=${optLine}`)
+            }
+            if (typeof it.payload?.option_symbol === "string" && it.payload.option_symbol) {
+              summaryParts.push(`option_symbol=${it.payload.option_symbol}`)
+            }
+            const lastReqBar = Array.isArray(it.payload?.ohlcv_1m) ? it.payload.ohlcv_1m[it.payload.ohlcv_1m.length - 1] : null
+            const lastPx =
+              typeof lastReqBar?.c === "number"
+                ? lastReqBar.c
+                : typeof lastReqBar?.close === "number"
+                  ? lastReqBar.close
+                  : null
+            if (lastPx != null) summaryParts.push(`underlying_price=${lastPx}`)
+            if (pos?.risk) {
+              if (pos.risk.stop_loss_premium != null) summaryParts.push(`stop_loss=${pos.risk.stop_loss_premium}`)
+              if (pos.risk.take_profit_premium != null) summaryParts.push(`take_profit=${pos.risk.take_profit_premium}`)
+              if (pos.risk.time_stop_minutes != null) summaryParts.push(`time_stop_minutes=${pos.risk.time_stop_minutes}`)
+            }
+            if (d?.exit?.contracts_to_close) summaryParts.push(`contracts=${d.exit.contracts_to_close}`)
+            if (d?.adjustments?.new_stop_loss_premium != null) summaryParts.push(`stop_loss=${d.adjustments.new_stop_loss_premium}`)
+            if (d?.adjustments?.new_take_profit_premium != null) summaryParts.push(`take_profit=${d.adjustments.new_take_profit_premium}`)
+            if (d?.adjustments?.new_time_stop_minutes != null) summaryParts.push(`time_stop_minutes=${d.adjustments.new_time_stop_minutes}`)
             const optPx = it.payload?.position_option_quote?.asof_price
-            summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
+            summaryParts.push(`option_price=${optPx ?? "N/A"}`)
             return { role: "ai" as const, content: summaryParts.join("\n"), time: formatPSTFromRFC3339(it.ts) }
           })
           return [...base, ...mapped]
@@ -274,50 +279,38 @@ export default function TrackingDetailPage() {
   }, [analysisId, baseHttp, symbol])
 
   useEffect(() => {
-    async function fetchMarket() {
-      try {
-        const res = await fetch(`${baseHttp}/api/market/status`)
-        if (!res.ok) throw new Error("market status failed")
-        const data = (await res.json()) as MarketStatus
-        setMarket(data)
-      } catch {
-        setMarket(null)
-      }
-    }
-    if (!symbol) return
-    fetchMarket()
-    const t = window.setInterval(fetchMarket, 30_000)
-    return () => window.clearInterval(t)
-  }, [symbol, baseHttp])
-
-  useEffect(() => {
-    async function fetchPrevClose() {
-      try {
-        const asof = new Date().toISOString()
-        const res = await fetch(`${baseHttp}/api/stocks/prev_close?symbols=${encodeURIComponent(symbol)}&asof=${encodeURIComponent(asof)}`)
-        if (!res.ok) throw new Error("prev_close failed")
-        const data = await res.json()
-        setPrevClose(data.prev_close?.[symbol] ?? null)
-      } catch {
-        setPrevClose(null)
-      }
-    }
-    if (symbol) fetchPrevClose()
-  }, [symbol, baseHttp])
-
-  useEffect(() => {
     const session = market?.session
     if (!symbol || !session) return
 
-    async function fetchClosedSnapshot() {
-      try {
-        const res1 = await fetch(`${baseHttp}/api/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=1Min&limit=400`)
-        if (res1.ok) {
-          const data = await res1.json()
-          const nextBars = (data?.bars?.[symbol] ?? []) as any[]
-          if (Array.isArray(nextBars)) setBars(nextBars)
-        }
-      } catch (e) {}
+    async function fetchOffHoursSnapshot() {
+      const start = market?.last_rth_open
+      const end = market?.last_rth_close
+      if (start && end) {
+        try {
+          const res1 = await fetch(
+            `${baseHttp}/api/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=5Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=10000`,
+          )
+          if (res1.ok) {
+            const data = await res1.json()
+            const nextBars = (data?.bars?.[symbol] ?? []) as any[]
+            if (Array.isArray(nextBars)) {
+              const withMarkers = applyMarkersToBars(nextBars)
+              setBars(withMarkers)
+              const sorted = [...nextBars]
+                .map((b) => ({ b, ms: Date.parse(String(b?.t ?? "")) }))
+                .filter((x) => Number.isFinite(x.ms))
+                .sort((a, b) => a.ms - b.ms)
+                .map((x) => x.b)
+              const first = sorted.length ? sorted[0] : null
+              const last = sorted.length ? sorted[sorted.length - 1] : null
+              const o = typeof first?.o === "number" ? (first.o as number) : null
+              const c = typeof last?.c === "number" ? (last.c as number) : null
+              const pct = typeof o === "number" && typeof c === "number" && o !== 0 ? ((c - o) / o) * 100 : null
+              setPrevSession({ open: o, close: c, openToClosePct: pct })
+            }
+          }
+        } catch {}
+      }
 
       try {
         const res2 = await fetch(`${baseHttp}/api/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=1Day&limit=10`)
@@ -332,8 +325,11 @@ export default function TrackingDetailPage() {
       }
     }
 
-    if (session === "closed") fetchClosedSnapshot()
-  }, [symbol, market?.session, baseHttp])
+    if (isOffHoursReadOnly) fetchOffHoursSnapshot()
+    else {
+      setPrevSession(null)
+    }
+  }, [symbol, isOffHoursReadOnly, market?.last_rth_open, market?.last_rth_close, market?.session, baseHttp, applyMarkersToBars])
 
   useEffect(() => {
     intentionalCloseRef.current = true
@@ -341,33 +337,16 @@ export default function TrackingDetailPage() {
     wsRef.current = null
 
     if (!symbol) return
-    if (!market) return
-    if (market?.session === "closed" && !isDev) {
+    if (!market?.session) return
+    if (isOffHoursReadOnly) {
       setWsStatus("closed")
-      setAiMessages((prev) => {
-        const last = prev[prev.length - 1]
-        if (last && last.role === "system" && typeof last.content === "string" && last.content.includes("Market is closed")) return prev
-        return [
-          ...prev,
-          {
-            role: "system",
-            content: "Market is closed. Detail page is in read-only mode (chart and AI are not updating).",
-            time: formatPSTFromRFC3339(new Date().toISOString()),
-          },
-        ]
-      })
       return
     }
 
     intentionalCloseRef.current = false
     setWsStatus("connecting")
 
-    let url = ""
-    if (isDev) {
-      url = `${baseWs}/ws/playback?symbols=${encodeURIComponent(symbol)}&start=${encodeURIComponent(DEV_PLAYBACK_START_UTC)}&speed=1.0&flow=timer`
-    } else {
-      url = `${baseWs}/ws/realtime?symbols=${encodeURIComponent(symbol)}&analyze=true`
-    }
+    const url = `${baseWs}/ws/realtime?symbols=${encodeURIComponent(symbol)}&analyze=true`
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -397,7 +376,14 @@ export default function TrackingDetailPage() {
       if (msg.type === "init") {
         if (msg.symbol === symbol) setBars(applyMarkersToBars(msg.bars || []))
       } else if (msg.type === "bar") {
-        if (msg.symbol === symbol) setBars((prev) => applyMarkersToBars([...prev, msg.bar].slice(-1000)))
+        if (msg.symbol === symbol) {
+          const hasTrigger = Boolean((msg as any).analysis_trigger_reason)
+          const o = typeof (msg as any)?.bar?.o === "number" ? (msg as any).bar.o : null
+          const c = typeof (msg as any)?.bar?.c === "number" ? (msg as any).bar.c : null
+          const color: "green" | "red" = typeof o === "number" && typeof c === "number" && c >= o ? "green" : "red"
+          const nextBar = hasTrigger ? { ...(msg as any).bar, ui_marker: { kind: "analysis", color } } : msg.bar
+          setBars((prev) => applyMarkersToBars([...prev, nextBar].slice(-1000)))
+        }
       } else if (msg.type === "analysis") {
         if (msg.symbol === symbol) {
           const res = msg.result as AnalysisResult
@@ -406,32 +392,55 @@ export default function TrackingDetailPage() {
           setBars((prev) => applyMarkersToBars(prev))
           setAiMessages((prev) => [
             ...prev,
-            { role: "ai", content: res, time: formatPSTFromRFC3339(res?.timestamp ?? new Date().toISOString()), type: "analysis" },
+            {
+              role: "ai",
+              content: res,
+              time: formatPSTFromRFC3339(res?.timestamp ?? new Date().toISOString()),
+              type: "analysis",
+              trigger_reason: (msg as any)?.trigger_reason as any,
+            },
           ])
         }
       } else if (msg.type === "state") {
         if (msg.symbol === symbol) {
-          setSessionState({
-            state: msg.state,
-            inPosition: msg.in_position,
-            contractsRemaining: msg.contracts_remaining ?? null,
-            contractsTotal: msg.contracts_total ?? null,
-          })
+          lastStreamStateRef.current = {
+            contracts_remaining: typeof (msg as any).contracts_remaining === "number" ? (msg as any).contracts_remaining : null,
+            option: (msg as any).option ?? null,
+            option_symbol: (msg as any).option_symbol ?? null,
+          }
         }
       } else if (msg.type === "position") {
         if (msg.symbol === symbol) {
           const res = msg.result as any
           const d = res.decision
-          const last = bars.length ? bars[bars.length - 1] : null
+          const last = barsRef.current.length ? barsRef.current[barsRef.current.length - 1] : null
           const lastPx = typeof last?.c === "number" ? last.c : null
           const summaryParts = [`POSITION_MGMT: ${d.action}`, d.reasoning]
-          summaryParts.push(`last_px=${lastPx ?? "N/A"}`)
+          summaryParts.push(`underlying_symbol=${symbol}`)
+          if (typeof lastStreamStateRef.current.contracts_remaining === "number") {
+            summaryParts.push(`contracts=${lastStreamStateRef.current.contracts_remaining}`)
+          }
+          const opt = lastStreamStateRef.current.option
+          if (opt) {
+            const right = String((opt as any)?.right ?? "").toUpperCase()
+            const exp = String((opt as any)?.expiration ?? "")
+            const strike = (opt as any)?.strike
+            const strikeStr = typeof strike === "number" ? String(strike) : ""
+            const optLine = [right, exp, strikeStr].filter(Boolean).join(" ")
+            if (optLine) summaryParts.push(`option=${optLine}`)
+            const r = String((opt as any)?.right ?? "").toLowerCase()
+            if (r === "call") summaryParts.push("direction=long")
+            else if (r === "put") summaryParts.push("direction=short")
+          }
+          const optSym = res?.option_symbol ?? lastStreamStateRef.current.option_symbol ?? null
+          if (optSym) summaryParts.push(`option_symbol=${optSym}`)
+          summaryParts.push(`underlying_price=${lastPx ?? "N/A"}`)
           const optPx = res?.position_option_quote?.asof_price
-          summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
-          if (d.exit?.contracts_to_close) summaryParts.push(`contracts_to_close=${d.exit.contracts_to_close}`)
-          if (d.adjustments?.new_stop_loss_premium != null) summaryParts.push(`new_stop=${d.adjustments.new_stop_loss_premium}`)
-          if (d.adjustments?.new_take_profit_premium != null) summaryParts.push(`new_tp=${d.adjustments.new_take_profit_premium}`)
-          if (d.adjustments?.new_time_stop_minutes != null) summaryParts.push(`new_time_stop=${d.adjustments.new_time_stop_minutes}`)
+          summaryParts.push(`option_price=${optPx ?? "N/A"}`)
+          if (d.exit?.contracts_to_close) summaryParts.push(`contracts=${d.exit.contracts_to_close}`)
+          if (d.adjustments?.new_stop_loss_premium != null) summaryParts.push(`stop_loss=${d.adjustments.new_stop_loss_premium}`)
+          if (d.adjustments?.new_take_profit_premium != null) summaryParts.push(`take_profit=${d.adjustments.new_take_profit_premium}`)
+          if (d.adjustments?.new_time_stop_minutes != null) summaryParts.push(`time_stop_minutes=${d.adjustments.new_time_stop_minutes}`)
           setAiMessages((prev) => [
             ...prev,
             {
@@ -448,7 +457,7 @@ export default function TrackingDetailPage() {
       intentionalCloseRef.current = true
       ws.close()
     }
-  }, [symbol, market?.session, baseWs])
+  }, [applyMarkersToBars, baseWs, isOffHoursReadOnly, market?.session, recordAnalysisMarker, symbol])
 
   useEffect(() => {
     if (!market) return
@@ -468,126 +477,69 @@ export default function TrackingDetailPage() {
     })
   }, [market?.session])
 
+  const chartPrevClose = isOffHoursReadOnly ? prevSession?.open : prevClose
+
   return (
-    <main className="flex h-screen flex-col bg-neon-radial text-white font-sans overflow-hidden">
-      <div className="flex-none border-b border-white/10 bg-black/20 backdrop-blur-xl px-6 py-4">
-        <div className="mx-auto flex max-w-[1600px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex items-center gap-4">
-            <Link href="/tracking" className="rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white/70 ring-1 ring-white/10 hover:bg-white/10 hover:text-white">
-              ← Back
-            </Link>
-            <div className="flex items-baseline gap-3 min-w-0">
-              <div className="text-2xl font-black tracking-tight">{symbol}</div>
-              {typeof lastPrice === "number" && <div className="text-sm font-mono text-white/80">{lastPrice.toFixed(2)}</div>}
-              {typeof headerChangePct === "number" && (
-                <div className={cn("text-xs font-bold", headerChangePct >= 0 ? "text-emerald-400" : "text-red-400")}>
-                  {headerChangePct >= 0 ? "+" : ""}
-                  {headerChangePct.toFixed(2)}%
-                </div>
-              )}
+    <TickerConsole
+      symbol={symbol}
+      bars={bars}
+      prevClose={chartPrevClose}
+      chartStatus={wsStatus === "open" ? "hot" : "normal"}
+      aiMessages={aiMessages}
+      headerLeft={
+        <div className="flex items-center gap-4">
+          <Link href="/tracking" className="rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white/70 ring-1 ring-white/10 hover:bg-white/10 hover:text-white">
+            ← Back
+          </Link>
+          <div className="flex items-baseline gap-3 min-w-0">
+            <div className="text-2xl font-black tracking-tight">{symbol}</div>
+            {typeof headerDisplayPrice === "number" && <div className="text-sm font-mono text-white/80">{headerDisplayPrice.toFixed(2)}</div>}
+            {typeof headerDisplayPct === "number" && (
+              <div className={cn("text-xs font-bold", headerDisplayPct >= 0 ? "text-emerald-400" : "text-red-400")}>
+                {headerDisplayPct >= 0 ? "+" : ""}
+                {headerDisplayPct.toFixed(2)}%
+              </div>
+            )}
+          </div>
+
+          {market && (
+            <div className={cn("flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ring-1", marketPillClass(market.session))}>
+              <span className={cn("h-2 w-2 rounded-full", market.session === "regular" ? "bg-emerald-400" : market.session === "closed" ? "bg-white/30" : "bg-cyan-400")} />
+              {marketLabel(market.session)}
             </div>
+          )}
 
-            {market && (
-              <div className={cn("flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ring-1", marketPillClass(market.session))}>
-                <span className={cn("h-2 w-2 rounded-full", market.session === "regular" ? "bg-emerald-400" : market.session === "closed" ? "bg-white/30" : "bg-cyan-400")} />
-                {marketLabel(market.session)}
-              </div>
-            )}
+          {extTag && <div className="rounded-full bg-white/5 px-3 py-1 text-xs font-black text-white/60 ring-1 ring-white/10">{extTag}</div>}
 
-            {extTag && (
-              <div className="rounded-full bg-white/5 px-3 py-1 text-xs font-black text-white/60 ring-1 ring-white/10">{extTag}</div>
-            )}
+          {countdown && (
+            <div className="hidden sm:flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-mono text-white/60 ring-1 ring-white/10">
+              <span className="text-white/40">{countdown.label}</span>
+              <span>{formatCountdown(countdown.ms)}</span>
+            </div>
+          )}
 
-            {countdown && (
-              <div className="hidden sm:flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-mono text-white/60 ring-1 ring-white/10">
-                <span className="text-white/40">{countdown.label}</span>
-                <span>{formatCountdown(countdown.ms)}</span>
-              </div>
+          <div
+            className={cn(
+              "flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ring-1",
+              wsStatus === "open"
+                ? "bg-emerald-500/10 text-emerald-300 ring-emerald-500/20"
+                : wsStatus === "connecting"
+                  ? "bg-cyan-500/10 text-cyan-200 ring-cyan-500/20"
+                  : wsStatus === "error"
+                    ? "bg-red-500/10 text-red-200 ring-red-500/20"
+                    : "bg-white/5 text-white/50 ring-white/10",
             )}
-            <div
+          >
+            <span
               className={cn(
-                "flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ring-1",
-                wsStatus === "open"
-                  ? "bg-emerald-500/10 text-emerald-300 ring-emerald-500/20"
-                  : wsStatus === "connecting"
-                    ? "bg-cyan-500/10 text-cyan-200 ring-cyan-500/20"
-                    : wsStatus === "error"
-                      ? "bg-red-500/10 text-red-200 ring-red-500/20"
-                      : "bg-white/5 text-white/50 ring-white/10",
+                "h-2 w-2 rounded-full",
+                wsStatus === "open" ? "bg-emerald-400" : wsStatus === "connecting" ? "bg-cyan-400" : wsStatus === "error" ? "bg-red-400" : "bg-white/30",
               )}
-            >
-              <span
-                className={cn(
-                  "h-2 w-2 rounded-full",
-                  wsStatus === "open" ? "bg-emerald-400" : wsStatus === "connecting" ? "bg-cyan-400" : wsStatus === "error" ? "bg-red-400" : "bg-white/30",
-                )}
-              />
-              {wsStatus === "open" ? (isDev ? "Replaying" : "Realtime") : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
-            </div>
+            />
+            {wsStatus === "open" ? "Realtime" : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
           </div>
         </div>
-      </div>
-
-      <div className="flex-1 overflow-hidden p-6">
-        <div className="mx-auto flex h-full max-w-[1600px] gap-6">
-          <div className="flex-[2] min-w-0 flex flex-col gap-4">
-            {market?.session === "pre_market" || market?.session === "after_hours" ? (
-              <div className="rounded-2xl bg-white/5 px-4 py-3 text-xs text-white/70 ring-1 ring-white/10">
-                延长交易时段：流动性更薄，滑点风险更高
-              </div>
-            ) : null}
-
-            {market?.session === "closed" ? (
-              <div className="rounded-2xl bg-white/5 px-4 py-3 text-sm text-white/70 ring-1 ring-white/10">
-                <div className="font-bold text-white/80">Market Closed</div>
-                {countdown && <div className="mt-1 text-xs font-mono text-white/60">{countdown.label}: {formatCountdown(countdown.ms)}</div>}
-                <div className="mt-2 text-xs text-white/50">休市：图表已冻结在最后交易时段，AI 不进行实时更新</div>
-                {lastDaily && (
-                  <div className="mt-3 grid grid-cols-2 gap-2 text-xs font-mono text-white/70">
-                    <div>O {Number(lastDaily.o).toFixed(2)}</div>
-                    <div>H {Number(lastDaily.h).toFixed(2)}</div>
-                    <div>L {Number(lastDaily.l).toFixed(2)}</div>
-                    <div>C {Number(lastDaily.c).toFixed(2)}</div>
-                  </div>
-                )}
-                {closedSummary && (
-                  <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] font-mono text-white/55">
-                    <div>
-                      Gap {typeof closedSummary.gapPct === "number" ? `${closedSummary.gapPct >= 0 ? "+" : ""}${closedSummary.gapPct.toFixed(2)}%` : "—"}
-                    </div>
-                    <div>
-                      Day {typeof closedSummary.dayPct === "number" ? `${closedSummary.dayPct >= 0 ? "+" : ""}${closedSummary.dayPct.toFixed(2)}%` : "—"}
-                    </div>
-                    <div>Range {Number.isFinite(closedSummary.range) ? closedSummary.range.toFixed(2) : "—"}</div>
-                  </div>
-                )}
-                <div className="mt-3">
-                  <Link
-                    href={`/dashboard?symbol=${encodeURIComponent(symbol)}`}
-                    className="inline-flex items-center justify-center rounded-xl bg-white px-4 py-2 text-xs font-bold text-black hover:bg-cyan-50"
-                  >
-                    Open Replay Console
-                  </Link>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="relative flex-1 rounded-3xl bg-black/40 shadow-neo ring-1 ring-white/10 backdrop-blur-md overflow-hidden p-1">
-              <CandleCard
-                symbol={symbol}
-                bars={bars}
-                prevClose={prevClose}
-                className="h-full w-full !bg-transparent !shadow-none !ring-0 !backdrop-blur-none"
-                status={wsStatus === "open" ? "hot" : "normal"}
-              />
-            </div>
-          </div>
-
-          <div className="flex-1 min-w-[320px] hidden lg:block">
-            <AICopilot symbol={symbol} messages={aiMessages} />
-          </div>
-        </div>
-      </div>
-    </main>
+      }
+    />
   )
 }

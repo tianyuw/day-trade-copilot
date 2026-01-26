@@ -4,7 +4,7 @@ import time
 import json
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List
 from alpaca.data.historical import StockHistoricalDataClient
@@ -13,7 +13,11 @@ from alpaca.data.timeframe import TimeFrame
 
 from .plotting import generate_chart_image
 from .llm_client import LLMClient
-from .llm_prompts import get_llm_system_prompt
+from .llm_prompts import (
+    get_llm_system_prompt,
+    NEARBY_LEVEL_FILTER_BUY_LONG,
+    NEARBY_LEVEL_FILTER_BUY_SHORT,
+)
 from .schemas import (
     LLMAnalysisRequest,
     LLMAnalysisResponse,
@@ -108,9 +112,144 @@ class AnalysisService:
         except Exception:
             return None
 
+    async def _get_premarket_high_low(
+        self,
+        symbol: str,
+        current_dt: datetime,
+        df_intraday: pd.DataFrame,
+    ) -> tuple[float | None, float | None]:
+        ny = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+
+        dt_ny = current_dt.astimezone(ny)
+        d = dt_ny.date()
+
+        start_ny = datetime.combine(d, dt_time(4, 0), tzinfo=ny)
+        end_ny = datetime.combine(d, dt_time(9, 30), tzinfo=ny)
+        start_utc = start_ny.astimezone(utc)
+        end_utc = end_ny.astimezone(utc)
+
+        if current_dt < start_utc:
+            return None, None
+
+        window_end = current_dt if current_dt < end_utc else end_utc
+
+        df_pm = pd.DataFrame()
+        try:
+            if df_intraday is not None and not df_intraday.empty and isinstance(df_intraday.index, pd.DatetimeIndex):
+                df_idx = df_intraday
+                if df_idx.index.tz is None:
+                    df_idx = df_intraday.copy()
+                    df_idx.index = df_idx.index.tz_localize(utc)
+                else:
+                    df_idx = df_intraday.copy()
+                    df_idx.index = df_idx.index.tz_convert(utc)
+                df_pm = df_idx[(df_idx.index >= start_utc) & (df_idx.index < window_end)]
+        except Exception:
+            df_pm = pd.DataFrame()
+
+        if df_pm.empty:
+            try:
+                df_pm = await self._get_bars_df(symbol, "1Min", start_utc, window_end, 1000)
+            except Exception:
+                df_pm = pd.DataFrame()
+
+        if df_pm is None or df_pm.empty:
+            return None, None
+
+        pm_high: float | None
+        pm_low: float | None
+        try:
+            pm_high = float(df_pm["high"].max()) if "high" in df_pm.columns else None
+        except Exception:
+            pm_high = None
+        try:
+            pm_low = float(df_pm["low"].min()) if "low" in df_pm.columns else None
+        except Exception:
+            pm_low = None
+
+        return pm_high, pm_low
+
     def _stable_analysis_id(self, symbol: str, current_time: str) -> str:
         raw = f"{symbol}|{current_time}|{self._model_hint}|{self._prompt_hash}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _nearby_level_system_prompt_extra(
+        self,
+        *,
+        latest_close: float,
+        latest_high: float | None,
+        latest_low: float | None,
+        day_high: float | None,
+        day_low: float | None,
+        premarket_high: float | None,
+        premarket_low: float | None,
+        prev_day_high: float | None,
+        prev_day_low: float | None,
+    ) -> str:
+        def valid_level(v: float | None) -> float | None:
+            if v is None:
+                return None
+            try:
+                f = float(v)
+            except Exception:
+                return None
+            if f <= 0:
+                return None
+            return f
+
+        def approx_equal(a: float | None, b: float | None) -> bool:
+            if a is None or b is None:
+                return False
+            try:
+                af = float(a)
+                bf = float(b)
+            except Exception:
+                return False
+            tol = max(1e-6 * max(abs(af), abs(bf), 1.0), 1e-4)
+            return abs(af - bf) <= tol
+
+        try:
+            close = float(latest_close)
+        except Exception:
+            return ""
+
+        if close <= 0:
+            return ""
+
+        dh = valid_level(day_high)
+        dl = valid_level(day_low)
+        pmh = valid_level(premarket_high)
+        pml = valid_level(premarket_low)
+        pdh = valid_level(prev_day_high)
+        pdl = valid_level(prev_day_low)
+
+        if approx_equal(latest_high, dh) or approx_equal(latest_low, dl):
+            return ""
+
+        threshold = 0.005 * close
+
+        resistance_levels = [v for v in [dh, pmh, pdh] if v is not None and v > close]
+        support_levels = [v for v in [dl, pml, pdl] if v is not None and v < close]
+
+        include_long = False
+        if resistance_levels:
+            nearest_resistance = min(resistance_levels)
+            diff = nearest_resistance - close
+            include_long = diff > 0 and diff < threshold
+
+        include_short = False
+        if support_levels:
+            nearest_support = max(support_levels)
+            diff = close - nearest_support
+            include_short = diff > 0 and diff < threshold
+
+        blocks: list[str] = []
+        if include_long:
+            blocks.append(NEARBY_LEVEL_FILTER_BUY_LONG.strip())
+        if include_short:
+            blocks.append(NEARBY_LEVEL_FILTER_BUY_SHORT.strip())
+        return "\n".join(blocks).strip()
 
     async def analyze_signal(
         self, 
@@ -421,6 +560,10 @@ class AnalysisService:
             day_high = 0
             day_low = 0
 
+        premarket_high, premarket_low = await self._get_premarket_high_low(symbol, current_dt, df)
+        premarket_high_text = f"{premarket_high:.2f}" if premarket_high is not None else "N/A"
+        premarket_low_text = f"{premarket_low:.2f}" if premarket_low is not None else "N/A"
+
         # Construct textual context
         context_text = f"""
 Timestamp (PST): {current_dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime('%Y-%m-%d %H:%M:%S')}
@@ -436,6 +579,8 @@ Previous Day Stats:
 
 Intraday Stats:
 - Open: {open_price:.2f}
+- Pre-Market High: {premarket_high_text}
+- Pre-Market Low: {premarket_low_text}
 - Day High: {day_high:.2f}
 - Day Low: {day_low:.2f}
 - Current Price: {intraday_records[-1]['close']:.2f}
@@ -500,45 +645,11 @@ Recent Price Action (Last 60 mins):
                             asof_px = (float(bid) + float(ask)) / 2.0
                         except Exception:
                             asof_px = None
-                    context_text += f"- {opt_sym} {right} {strike}: last≈{asof_px}, bid={bid}, ask={ask}\n"
+                    bid_text = bid if bid is not None else "N/A"
+                    ask_text = ask if ask is not None else "N/A"
+                    context_text += f"- {opt_sym} {right} {strike}: last≈{asof_px}, bid={bid_text}, ask={ask_text}\n"
         except Exception:
             pass
-
-        # Check for Hard Exit (Stop Loss / Take Profit) before calling LLM
-        if position_option_quote and req.position.risk:
-            try:
-                bid = float(position_option_quote.get("bid") or 0.0)
-                sl = float(req.position.risk.stop_loss_premium or 0.0)
-                tp = float(req.position.risk.take_profit_premium or 0.0)
-                
-                decision_action = None
-                decision_reason = ""
-                
-                if sl > 0 and bid > 0 and bid <= sl:
-                    decision_action = "close_all"
-                    decision_reason = f"Hard Stop Loss Triggered: Current Bid ({bid:.2f}) <= Stop Loss ({sl:.2f})"
-                elif tp > 0 and bid > 0 and bid >= tp:
-                    decision_action = "close_all"
-                    decision_reason = f"Hard Take Profit Triggered: Current Bid ({bid:.2f}) >= Take Profit ({tp:.2f})"
-                
-                if decision_action:
-                    return PositionManagementResponse(
-                        trade_id=req.trade_id,
-                        analysis_id="hard_exit_rule",
-                        timestamp=req.bar_time,
-                        symbol=req.symbol,
-                        bar_time=req.bar_time,
-                        decision={
-                            "action": decision_action,
-                            "reasoning": decision_reason,
-                            "exit": {"contracts_to_close": req.position.contracts_remaining},
-                            "adjustments": None
-                        },
-                        position_option_quote=position_option_quote
-                    )
-            except Exception as e:
-                print(f"Hard exit check failed: {e}")
-                pass
 
         context_text += "\nBenchmark Context (Proxy Futures):\n"
         benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
@@ -581,7 +692,38 @@ Recent Price Action (Last 60 mins):
             else:
                 context_text += "    - N/A\n"
 
-        response = await self.llm_client.analyze_chart(request, chart_base64, context_text)
+        latest = intraday_records[-1] if intraday_records else {}
+        try:
+            latest_close = float(latest.get("close", 0.0))
+        except Exception:
+            latest_close = 0.0
+        try:
+            latest_high = float(latest.get("high")) if latest.get("high") is not None else None
+        except Exception:
+            latest_high = None
+        try:
+            latest_low = float(latest.get("low")) if latest.get("low") is not None else None
+        except Exception:
+            latest_low = None
+
+        system_prompt_extra = self._nearby_level_system_prompt_extra(
+            latest_close=latest_close,
+            latest_high=latest_high,
+            latest_low=latest_low,
+            day_high=day_high,
+            day_low=day_low,
+            premarket_high=premarket_high,
+            premarket_low=premarket_low,
+            prev_day_high=prev_day_high,
+            prev_day_low=prev_day_low,
+        )
+
+        response = await self.llm_client.analyze_chart(
+            request,
+            chart_base64,
+            context_text,
+            system_prompt_extra=system_prompt_extra,
+        )
         return response
 
     async def manage_position(self, req: PositionManagementRequest) -> PositionManagementResponse:
@@ -714,6 +856,10 @@ Recent Price Action (Last 60 mins):
             day_high = 0.0
             day_low = 0.0
 
+        premarket_high, premarket_low = await self._get_premarket_high_low(symbol, current_dt, df)
+        premarket_high_text = f"{premarket_high:.2f}" if premarket_high is not None else "N/A"
+        premarket_low_text = f"{premarket_low:.2f}" if premarket_low is not None else "N/A"
+
         latest_close = float(intraday_records[-1]["close"]) if intraday_records else 0.0
         daily_trend = ", ".join([f"{float(r['close']):.2f}" for r in daily_records if "close" in r])
 
@@ -731,6 +877,8 @@ Previous Day Stats:
 
 Intraday Stats:
 - Open: {open_price:.2f}
+- Pre-Market High: {premarket_high_text}
+- Pre-Market Low: {premarket_low_text}
 - Day High: {day_high:.2f}
 - Day Low: {day_low:.2f}
 - Current Price: {latest_close:.2f}
@@ -829,11 +977,8 @@ Recent Price Action (Last 60 mins):
                     f"- {sym} {right} {strike} exp={exp}: last≈{asof_px}, bid={bid}, ask={ask}\n"
                 )
             elif opt_sym:
-                end_iso = current_dt.isoformat().replace("+00:00", "Z")
-                start_iso = (current_dt - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
-                quotes = await self.alpaca.get_option_quotes([opt_sym], start=start_iso, end=end_iso, limit=1000)
-                rows = quotes.get(opt_sym, []) if isinstance(quotes, dict) else []
-                last = rows[-1] if rows else None
+                quotes = await self.alpaca.get_option_latest_quotes([opt_sym])
+                last = quotes.get(opt_sym) if isinstance(quotes, dict) else None
                 if isinstance(last, dict):
                     try:
                         bp = last.get("bp")
@@ -855,6 +1000,60 @@ Recent Price Action (Last 60 mins):
                     )
         except Exception:
             pass
+
+        if position_option_quote and req.position.risk:
+            try:
+                px_raw = position_option_quote.get("asof_price")
+                if px_raw is None:
+                    px_raw = position_option_quote.get("bid")
+                px = float(px_raw or 0.0)
+                sl = float(req.position.risk.stop_loss_premium or 0.0)
+                tp = float(req.position.risk.take_profit_premium or 0.0)
+                direction = str(getattr(req.position, "direction", "") or "").lower()
+
+                decision_action = None
+                decision_reason = ""
+
+                if sl > 0 and px > 0:
+                    if direction == "short" and px >= sl:
+                        decision_action = "close_all"
+                        decision_reason = f"Hard stop loss triggered: option_price ({px:.2f}) >= stop_loss ({sl:.2f})"
+                    elif direction != "short" and px <= sl:
+                        decision_action = "close_all"
+                        decision_reason = f"Hard stop loss triggered: option_price ({px:.2f}) <= stop_loss ({sl:.2f})"
+                if decision_action is None and tp > 0 and px > 0:
+                    if direction == "short" and px <= tp:
+                        decision_action = "close_all"
+                        decision_reason = f"Hard take profit triggered: option_price ({px:.2f}) <= take_profit ({tp:.2f})"
+                    elif direction != "short" and px >= tp:
+                        decision_action = "close_all"
+                        decision_reason = f"Hard take profit triggered: option_price ({px:.2f}) >= take_profit ({tp:.2f})"
+
+                if decision_action:
+                    opt_sym_out = None
+                    try:
+                        opt_sym_out = str(position_option_quote.get("symbol") or "").strip().upper() or None
+                    except Exception:
+                        opt_sym_out = None
+                    if not opt_sym_out:
+                        opt_sym_out = (req.option_symbol or "").strip().upper() or None
+                    return PositionManagementResponse(
+                        trade_id=req.trade_id,
+                        analysis_id="hard_exit_rule",
+                        timestamp=req.bar_time,
+                        symbol=req.symbol,
+                        bar_time=req.bar_time,
+                        decision={
+                            "action": decision_action,
+                            "reasoning": decision_reason,
+                            "exit": {"contracts_to_close": req.position.contracts_remaining},
+                            "adjustments": None,
+                        },
+                        position_option_quote=position_option_quote,
+                        option_symbol=opt_sym_out,
+                    )
+            except Exception as e:
+                print(f"Hard exit check failed: {e}")
 
         context_text += "\nBenchmark Context (Proxy Futures):\n"
         benchmark_symbols = [s.strip().upper() for s in os.getenv("BENCHMARK_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
@@ -903,4 +1102,15 @@ Recent Price Action (Last 60 mins):
                 resp = resp.model_copy(update={"position_option_quote": position_option_quote})
             except Exception:
                 pass
+        try:
+            opt_sym_out = None
+            try:
+                opt_sym_out = str(position_option_quote.get("symbol") or "").strip().upper() or None if position_option_quote else None
+            except Exception:
+                opt_sym_out = None
+            if not opt_sym_out:
+                opt_sym_out = (req.option_symbol or "").strip().upper() or None
+            resp = resp.model_copy(update={"option_symbol": opt_sym_out})
+        except Exception:
+            pass
         return resp

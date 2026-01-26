@@ -43,22 +43,29 @@ function floorToMinute(ms: number): number {
   return Math.floor(ms / 60_000) * 60_000
 }
 
-function windowLastMinutes(bars: Bar[], minutes: number, anchorTimeRfc3339?: string): Bar[] {
+function floorToBucket(ms: number, bucketMinutes: number): number {
+  const stepMs = Math.max(1, Math.floor(bucketMinutes)) * 60_000
+  return Math.floor(ms / stepMs) * stepMs
+}
+
+function windowLastMinutes(bars: Bar[], minutes: number, anchorTimeRfc3339?: string, bucketMinutes = 1): Bar[] {
   if (bars.length === 0) return []
 
   const nowMs = Date.now()
   const lastBarMs = new Date(bars[bars.length - 1]!.t).getTime()
   const anchorOverrideMs = anchorTimeRfc3339 ? new Date(anchorTimeRfc3339).getTime() : NaN
   const anchorMs = Number.isFinite(anchorOverrideMs) ? anchorOverrideMs : Number.isFinite(lastBarMs) ? lastBarMs : nowMs
-  const endMs = floorToMinute(Number.isFinite(anchorMs) ? anchorMs : nowMs)
-  const startMs = endMs - (minutes - 1) * 60_000
+  const stepMs = Math.max(1, Math.floor(bucketMinutes)) * 60_000
+  const bucketCount = Math.max(1, Math.ceil(minutes / Math.max(1, Math.floor(bucketMinutes))))
+  const endMs = floorToBucket(Number.isFinite(anchorMs) ? anchorMs : nowMs, bucketMinutes)
+  const startMs = endMs - (bucketCount - 1) * stepMs
 
-  const byMinute = new Map<number, Bar>()
+  const byBucket = new Map<number, Bar>()
   for (const b of bars) {
-    const ms = floorToMinute(new Date(b.t).getTime())
+    const ms = floorToBucket(new Date(b.t).getTime(), bucketMinutes)
     if (!Number.isFinite(ms)) continue
-    if (ms < startMs - 60_000 * 5 || ms > endMs + 60_000 * 5) continue
-    byMinute.set(ms, b)
+    if (ms < startMs - stepMs * 2 || ms > endMs + stepMs * 2) continue
+    byBucket.set(ms, b)
   }
 
   let seed: number | null = null
@@ -81,8 +88,8 @@ function windowLastMinutes(bars: Bar[], minutes: number, anchorTimeRfc3339?: str
 
   const out: Bar[] = []
   let prevClose = seed
-  for (let ms = startMs; ms <= endMs; ms += 60_000) {
-    const bar = byMinute.get(ms)
+  for (let ms = startMs; ms <= endMs; ms += stepMs) {
+    const bar = byBucket.get(ms)
     if (bar) {
       out.push(bar)
       prevClose = bar.c
@@ -104,11 +111,13 @@ export function TrackingMiniChart({
   className,
   windowMinutes = 120,
   anchorTimeRfc3339,
+  bucketMinutes = 1,
 }: {
   bars: Bar[]
   className?: string
   windowMinutes?: number
   anchorTimeRfc3339?: string
+  bucketMinutes?: number
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -116,8 +125,8 @@ export function TrackingMiniChart({
   const pctSeriesRef = useRef<ReturnType<IChartApi["addLineSeries"]> | null>(null)
 
   const windowBars = useMemo(
-    () => windowLastMinutes(bars, windowMinutes, anchorTimeRfc3339),
-    [anchorTimeRfc3339, bars, windowMinutes],
+    () => windowLastMinutes(bars, windowMinutes, anchorTimeRfc3339, bucketMinutes),
+    [anchorTimeRfc3339, bars, bucketMinutes, windowMinutes],
   )
 
   const candles = useMemo(() => {

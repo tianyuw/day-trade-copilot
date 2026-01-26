@@ -9,6 +9,7 @@ from .schemas import (
 from .google_api_client import GoogleAPIClient
 from .llm_prompts import get_llm_system_prompt
 from .debug_logging import LLMExchangeMeta, Stopwatch, write_llm_exchange
+from .llm_json import parse_llm_json
 
 class LLMClient:
     def __init__(self):
@@ -23,10 +24,11 @@ class LLMClient:
         self, 
         request: LLMAnalysisRequest, 
         chart_image_base64: str,
-        context_text: str
+        context_text: str,
+        system_prompt_extra: str | None = None,
     ) -> LLMAnalysisResponse:
         
-        system_prompt = get_llm_system_prompt()
+        system_prompt = get_llm_system_prompt(system_prompt_extra)
 
         user_content_text = f"""Analyze the following market context for {request.symbol} at {request.current_time}.
 
@@ -60,7 +62,7 @@ Based on the chart and context, provide your trading decision JSON.
             )
             
             # Parse JSON and validate with Pydantic
-            parsed = json.loads(content)
+            parsed = parse_llm_json(content)
             data = parsed
             if isinstance(data, list):
                 if len(data) == 1 and isinstance(data[0], dict):
@@ -88,6 +90,7 @@ Based on the chart and context, provide your trading decision JSON.
                 ),
                 system_prompt=system_prompt,
                 user_prompt=user_content_text,
+                chart_image_base64=chart_image_base64,
                 response_raw=content,
                 parsed_json=data if isinstance(data, dict) else None,
                 error=None,
@@ -111,6 +114,7 @@ Based on the chart and context, provide your trading decision JSON.
                 ),
                 system_prompt=system_prompt,
                 user_prompt=user_content_text,
+                chart_image_base64=chart_image_base64,
                 response_raw=content,
                 parsed_json=data if isinstance(data, dict) else None,
                 error=str(e),
@@ -153,6 +157,8 @@ Based on the chart and context, provide your trading decision JSON.
             "- close_partial must specify contracts_to_close (1..contracts_remaining).\n"
             "- close_all should close all remaining contracts.\n"
             "- tighten_stop/adjust_take_profit/update_time_stop must specify the corresponding new_* field.\n"
+            "- For update_time_stop, new_time_stop_minutes is an INCREMENT (minutes to add) to the current position.risk.time_stop_minutes (not an absolute replacement).\n"
+            "- Example: if position.risk.time_stop_minutes=15 and you want +5 minutes, output new_time_stop_minutes=5.\n"
         )
 
         marker = "\nPosition Option Quote (as of"
@@ -208,7 +214,7 @@ Based on the chart and context, provide your position management decision JSON.
                 chart_image_base64=chart_image_base64,
             )
 
-            parsed = json.loads(content)
+            parsed = parse_llm_json(content)
             data = parsed
             if isinstance(data, list):
                 if len(data) == 1 and isinstance(data[0], dict):
@@ -240,6 +246,7 @@ Based on the chart and context, provide your position management decision JSON.
                 ),
                 system_prompt=system_prompt,
                 user_prompt=user_content_text,
+                chart_image_base64=chart_image_base64,
                 response_raw=content,
                 parsed_json=data if isinstance(data, dict) else None,
                 error=None,
@@ -261,6 +268,7 @@ Based on the chart and context, provide your position management decision JSON.
                 ),
                 system_prompt=system_prompt,
                 user_prompt=user_content_text,
+                chart_image_base64=chart_image_base64,
                 response_raw=content,
                 parsed_json=data if isinstance(data, dict) else None,
                 error=str(e),

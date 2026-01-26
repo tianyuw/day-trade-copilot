@@ -2,8 +2,11 @@
 
 import { useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { CandleCard } from "../../components/CandleCard"
-import { AICopilot, type ChatMessage } from "../../components/AICopilot"
+import type { ChatMessage } from "../../components/AICopilot"
+import { TickerConsole } from "../../components/TickerConsole"
+import { TransportControls } from "../../components/TransportControls"
+import { useBackendBaseUrls } from "../../components/hooks/useBackendBaseUrls"
+import { usePrevClose } from "../../components/hooks/usePrevClose"
 
 type Direction = "long" | "short"
 type OptionRight = "call" | "put"
@@ -15,6 +18,7 @@ type TradePlan = {
   contracts: number
   risk: { stop_loss_premium: number | null; time_stop_minutes: number | null }
   take_profit_premium: number | null
+  option_symbol?: string | null
 }
 type AnalysisAction = "buy_long" | "buy_short" | "ignore" | "follow_up" | "check_when_condition_meet"
 type AnalysisResult = {
@@ -54,6 +58,7 @@ type PositionManagementResponse = {
       new_time_stop_minutes?: number | null
     } | null
   }
+  option_symbol?: string | null
 }
 
 type StreamInit = {
@@ -63,46 +68,92 @@ type StreamInit = {
   bars: any[]
   cursor?: number
 }
-type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; bar: any; i?: number }
-type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
+type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; analysis_trigger_reason?: any; bar: any; i?: number }
+type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; trigger_reason?: any; result: any }
+type StreamState = {
+  type: "state"
+  mode: "realtime" | "playback"
+  symbol: string
+  state: string
+  in_position: boolean
+  contracts_total?: number | null
+  contracts_remaining?: number | null
+  trade_id?: string | null
+  option?: any | null
+  option_symbol?: string | null
+}
+type StreamPosition = { type: "position"; mode: "realtime" | "playback"; symbol: string; trigger_reason?: any; result: any }
 type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
 type StreamError = { type: "error"; message: string }
-type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamDone | StreamError
+type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamState | StreamPosition | StreamDone | StreamError
 
 const DEFAULT_SYMBOLS = ["META", "NVDA", "TSM", "PLTR", "AAPL", "NFLX", "SPY", "QQQ"]
 
-function toRFC3339FromPSTInput(v: string): string | null {
+const PT_TIME_ZONE = "America/Los_Angeles"
+const ptTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: PT_TIME_ZONE,
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+})
+
+function getTimeZoneOffsetMs(timeZone: string, date: Date): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date)
+  const m: Record<string, string> = {}
+  for (const p of parts) {
+    if (p.type !== "literal") m[p.type] = p.value
+  }
+  const asUtc = Date.UTC(
+    Number(m.year),
+    Number(m.month) - 1,
+    Number(m.day),
+    Number(m.hour),
+    Number(m.minute),
+    Number(m.second),
+  )
+  return asUtc - date.getTime()
+}
+
+function toRFC3339FromPTInput(v: string): string | null {
   if (!v) return null
   const [datePart, timePart] = v.split("T")
   if (!datePart || !timePart) return null
   const [year, month, day] = datePart.split("-").map(Number)
   const [hour, minute] = timePart.split(":").map(Number)
-  const d = new Date(Date.UTC(year, month - 1, day, hour + 8, minute))
+  const utcApprox = Date.UTC(year, month - 1, day, hour, minute, 0)
+  if (Number.isNaN(utcApprox)) return null
+
+  const offset1 = getTimeZoneOffsetMs(PT_TIME_ZONE, new Date(utcApprox))
+  let utcMs = utcApprox - offset1
+  const offset2 = getTimeZoneOffsetMs(PT_TIME_ZONE, new Date(utcMs))
+  if (offset2 !== offset1) utcMs = utcApprox - offset2
+  const d = new Date(utcMs)
   if (Number.isNaN(d.getTime())) return null
   return d.toISOString()
 }
+
+const toRFC3339FromPSTInput = toRFC3339FromPTInput
 
 function toEpochSeconds(rfc3339: string): number {
   return Math.floor(new Date(rfc3339).getTime() / 1000)
 }
 
-function pad2(n: number): string {
-  return String(n).padStart(2, "0")
+function formatPTFromUtcSeconds(utcSeconds: number): string {
+  return ptTimeFormatter.format(new Date(utcSeconds * 1000))
 }
 
-function formatPSTFromUtcSeconds(utcSeconds: number): string {
-  const pstMs = utcSeconds * 1000 - 8 * 60 * 60 * 1000
-  const d = new Date(pstMs)
-  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
-}
-
-function formatPSTFromRFC3339(rfc3339: string): string {
+function formatPTFromRFC3339(rfc3339: string): string {
   if (!rfc3339) return ""
-  return formatPSTFromUtcSeconds(toEpochSeconds(rfc3339))
-}
-
-function AICopilotPanel({ symbol, messages }: { symbol: string; messages: ChatMessage[] }) {
-  return <AICopilot symbol={symbol} messages={messages} />
+  return formatPTFromUtcSeconds(toEpochSeconds(rfc3339))
 }
 
 type TradeStateName = "SCAN" | "FOLLOW_UP_PENDING" | "WATCH_PENDING" | "IN_POSITION"
@@ -122,27 +173,36 @@ type PendingWatch = { watch: WatchCondition; created_at_epoch_s: number; expires
 
 export default function DashboardPage() {
   const search = useSearchParams()
+  const { baseHttp, baseWs } = useBackendBaseUrls()
   const [selectedSymbol, setSelectedSymbol] = useState("NVDA")
   const [startLocal, setStartLocal] = useState("2026-01-09T06:31")
+  const playbackFlow: "ack" = "ack"
+  const playbackPaceMs = 1000
+  const playbackSpeedSeconds = 1.0
   const [isPlaying, setIsPlaying] = useState(false)
-  const [playbackCursor, setPlaybackCursor] = useState(0)
-  const [wsToken, setWsToken] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [resetToken, setResetToken] = useState(0)
-  const [prevClose, setPrevClose] = useState<number | null>(null)
 
   const [bars, setBars] = useState<any[]>([])
   
   // AI State
   const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
+  const [backendState, setBackendState] = useState<string>("SCAN")
+  const [backendInPosition, setBackendInPosition] = useState(false)
+  const [backendContracts, setBackendContracts] = useState<{ remaining: number | null; total: number | null }>({
+    remaining: null,
+    total: null,
+  })
 
   const wsRef = useRef<WebSocket | null>(null)
   const intentionalCloseRef = useRef(false)
   const playbackCursorRef = useRef(0)
   const barsRef = useRef<any[]>([])
   const isPlayingRef = useRef(false)
+  const lastBackendStateRef = useRef("SCAN")
   const userPausedRef = useRef(false)
   const autoPausedRef = useRef(false)
+  const ackTimeoutRef = useRef<number | null>(null)
   const queuedMessagesRef = useRef<StreamMessage[]>([])
   const drainInProgressRef = useRef(false)
   const replaySessionIdRef = useRef(0)
@@ -163,6 +223,11 @@ export default function DashboardPage() {
     lastBarTime: null,
     manageInflight: false,
   })
+  const lastStreamStateRef = useRef<{
+    contracts_remaining: number | null
+    option: StreamState["option"] | null
+    option_symbol: string | null
+  }>({ contracts_remaining: null, option: null, option_symbol: null })
 
   const symbolOptions = useMemo(() => {
     const s = String(selectedSymbol || "").trim().toUpperCase()
@@ -188,12 +253,17 @@ export default function DashboardPage() {
       lastBarTime: null,
       manageInflight: false,
     }
+    lastStreamStateRef.current = { contracts_remaining: null, option: null, option_symbol: null }
     barsRef.current = []
+    setBackendState("SCAN")
+    setBackendInPosition(false)
+    setBackendContracts({ remaining: null, total: null })
+    lastBackendStateRef.current = "SCAN"
     setAiMessages([
       {
         role: "system",
         content: `AI Copilot initialized for ${selectedSymbol}. Monitoring price action...`,
-        time: formatPSTFromRFC3339(new Date().toISOString()),
+        time: formatPTFromRFC3339(new Date().toISOString()),
       },
     ])
   }, [selectedSymbol, resetToken])
@@ -219,6 +289,10 @@ export default function DashboardPage() {
     beginNewReplaySession()
     isPlayingRef.current = false
     intentionalCloseRef.current = true
+    if (ackTimeoutRef.current != null) {
+      try { window.clearTimeout(ackTimeoutRef.current) } catch {}
+      ackTimeoutRef.current = null
+    }
     try { wsRef.current?.close() } catch {}
     queuedMessagesRef.current = []
     autoPausedRef.current = false
@@ -246,19 +320,24 @@ export default function DashboardPage() {
       {
         role: "system",
         content: text,
-        time: formatPSTFromRFC3339(timeIso ?? new Date().toISOString()),
+        time: formatPTFromRFC3339(timeIso ?? new Date().toISOString()),
       },
     ])
   }
 
-  const appendAIAnalysis = (data: AnalysisResult, timeIso?: string) => {
+  const appendAIAnalysis = (
+    data: AnalysisResult,
+    timeIso?: string,
+    trigger_reason?: "quant_signal" | "follow_up" | "watch_condition" | "position_management",
+  ) => {
     setAiMessages((prev) => [
       ...prev,
       {
         role: "ai",
         content: data,
-        time: formatPSTFromRFC3339(timeIso ?? data?.timestamp ?? new Date().toISOString()),
+        time: formatPTFromRFC3339(timeIso ?? data?.timestamp ?? new Date().toISOString()),
         type: "analysis",
+        trigger_reason,
       },
     ])
   }
@@ -269,7 +348,7 @@ export default function DashboardPage() {
       {
         role: "ai",
         content: text,
-        time: formatPSTFromRFC3339(timeIso ?? new Date().toISOString()),
+        time: formatPTFromRFC3339(timeIso ?? new Date().toISOString()),
       },
     ])
   }
@@ -284,17 +363,6 @@ export default function DashboardPage() {
         return { ...m, content: { ...c, entry } }
       }),
     )
-  }
-
-  const applyBarUIMarker = (timeIso: string, marker: { kind: "follow_up" | "watch"; color: "green" | "red" }) => {
-    const last = barsRef.current[barsRef.current.length - 1]
-    if (!last) return
-    if (String(last?.t ?? "") !== timeIso) return
-    barsRef.current = [
-      ...barsRef.current.slice(0, -1),
-      { ...last, ui_marker: marker },
-    ]
-    setBars(barsRef.current)
   }
 
   const drainQueuedMessages = async (processMessage: (m: StreamMessage) => Promise<void>) => {
@@ -425,151 +493,15 @@ export default function DashboardPage() {
   }
 
   const requestAnalyze = async (timeIso: string) => {
-      let controller: AbortController | null = null
-      try {
-          const sessionId = replaySessionIdRef.current
-          controller = new AbortController()
-          inflightFetchControllersRef.current.add(controller)
-          const base = getBackendBase()
-          const res = await fetch(`${base}/api/analyze`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal: controller.signal,
-              body: JSON.stringify({
-                  symbol: selectedSymbol,
-                  current_time: timeIso,
-                  mode: "playback",
-              })
-          })
-          
-          if (!res.ok) throw new Error("Analysis failed")
-          
-          const data = (await res.json()) as AnalysisResult
-          if (sessionId !== replaySessionIdRef.current || !isPlayingRef.current) return
-          appendAIAnalysis(data, data?.timestamp ?? timeIso)
-          await handleAIResultForFSM(data)
-          
-      } catch (e) {
-          if (e instanceof DOMException && e.name === "AbortError") return
-          console.error(e)
-          appendSystem(`Analysis Error: ${e instanceof Error ? e.message : 'Unknown error'}`, new Date().toISOString())
-      } finally {
-          if (controller) inflightFetchControllersRef.current.delete(controller)
-      }
+    void timeIso
   }
 
   const requestPositionManage = async (barTimeIso: string) => {
-    const trade = fsmRef.current.trade
-    if (!trade) return
-    if (fsmRef.current.manageInflight) return
-    fsmRef.current.manageInflight = true
-    let controller: AbortController | null = null
-    try {
-      const sessionId = replaySessionIdRef.current
-      controller = new AbortController()
-      inflightFetchControllersRef.current.add(controller)
-      const base = getBackendBase()
-      const ohlcv = barsRef.current.slice(-300).map((b) => ({
-        t: b.t,
-        open: b.o,
-        high: b.h,
-        low: b.l,
-        close: b.c,
-        volume: b.v,
-      }))
-      const res = await fetch(`${base}/api/ai/position_manage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          trade_id: trade.trade_id,
-          symbol: selectedSymbol,
-          bar_time: barTimeIso,
-          mode: "playback",
-          position: {
-            direction: trade.direction,
-            option: trade.option,
-            contracts_total: trade.contracts_total,
-            contracts_remaining: trade.contracts_remaining,
-            entry: { time: trade.entry_time, premium: trade.entry_premium },
-            risk: trade.risk,
-          },
-          option_symbol: trade.option_symbol,
-          ohlcv_1m: ohlcv,
-        }),
-      })
-      if (!res.ok) throw new Error("Position manage failed")
-      const data = (await res.json()) as PositionManagementResponse
-      if (sessionId !== replaySessionIdRef.current || !isPlayingRef.current) return
-
-      const d = data.decision
-      const summaryParts = [`POSITION_MGMT: ${d.action}`, d.reasoning]
-      const lastBar = barsRef.current[barsRef.current.length - 1]
-      const lastPx = typeof lastBar?.c === "number" ? lastBar.c : null
-      summaryParts.push(`last_px=${lastPx ?? "N/A"}`)
-      const optPx = (data as any)?.position_option_quote?.asof_price
-      summaryParts.push(`option_premium=${optPx ?? "N/A"}`)
-      summaryParts.push(`contracts=${trade.contracts_remaining}/${trade.contracts_total}`)
-      summaryParts.push(`direction=${trade.direction}`)
-      summaryParts.push(`option=${trade.option.right} ${trade.option.expiration} ${trade.option.strike}`)
-      summaryParts.push(`option_symbol=${trade.option_symbol ?? "N/A"}`)
-      summaryParts.push(`stop_loss_premium=${trade.risk.stop_loss_premium ?? "N/A"}`)
-      summaryParts.push(`take_profit_premium=${trade.risk.take_profit_premium ?? "N/A"}`)
-      summaryParts.push(`time_stop_minutes=${trade.risk.time_stop_minutes ?? "N/A"}`)
-      if (d.exit?.contracts_to_close) summaryParts.push(`contracts_to_close=${d.exit.contracts_to_close}`)
-      if (d.adjustments?.new_stop_loss_premium != null) summaryParts.push(`new_stop=${d.adjustments.new_stop_loss_premium}`)
-      if (d.adjustments?.new_take_profit_premium != null) summaryParts.push(`new_tp=${d.adjustments.new_take_profit_premium}`)
-      if (d.adjustments?.new_time_stop_minutes != null) summaryParts.push(`new_time_stop=${d.adjustments.new_time_stop_minutes}`)
-      appendAIText(summaryParts.join("\n"), data.timestamp ?? barTimeIso)
-
-      if (d.action === "close_all") {
-        trade.contracts_remaining = 0
-      } else if (d.action === "close_partial") {
-        const n = d.exit?.contracts_to_close ?? 0
-        trade.contracts_remaining = Math.max(0, trade.contracts_remaining - Math.max(0, n))
-      } else if (d.action === "tighten_stop") {
-        if (d.adjustments?.new_stop_loss_premium != null) trade.risk.stop_loss_premium = d.adjustments.new_stop_loss_premium
-      } else if (d.action === "adjust_take_profit") {
-        if (d.adjustments?.new_take_profit_premium != null) trade.risk.take_profit_premium = d.adjustments.new_take_profit_premium
-      } else if (d.action === "update_time_stop") {
-        if (d.adjustments?.new_time_stop_minutes != null) trade.risk.time_stop_minutes = d.adjustments.new_time_stop_minutes
-      }
-
-      if (trade.contracts_remaining === 0) {
-        fsmRef.current.state = "SCAN"
-        fsmRef.current.trade = null
-        fsmRef.current.followUp = { armed: false }
-        fsmRef.current.watches = []
-      }
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") return
-      console.error(e)
-      appendSystem(`Position Mgmt Error: ${e instanceof Error ? e.message : "Unknown error"}`, barTimeIso)
-    } finally {
-      fsmRef.current.manageInflight = false
-      if (controller) inflightFetchControllersRef.current.delete(controller)
-    }
+    void barTimeIso
   }
 
-  const startRFC = useMemo(() => toRFC3339FromPSTInput(startLocal), [startLocal])
-
-  useEffect(() => {
-    async function fetchPrevClose() {
-      try {
-        const base =
-          process.env.NEXT_PUBLIC_BACKEND_API ??
-          `http://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_API_PORT ?? "8000"}`
-        const res = await fetch(`${base}/api/stocks/prev_close?symbols=${selectedSymbol}&asof=${startRFC}`)
-        if (!res.ok) throw new Error("Failed to fetch prev close")
-        const data = await res.json()
-        setPrevClose(data.prev_close?.[selectedSymbol] ?? null)
-      } catch (e) {
-        console.error(e)
-        setPrevClose(null)
-      }
-    }
-    if (startRFC) fetchPrevClose()
-  }, [selectedSymbol, startRFC])
+  const startRFC = useMemo(() => toRFC3339FromPTInput(startLocal), [startLocal])
+  const { prevClose } = usePrevClose(baseHttp, selectedSymbol, { asof: startRFC, enabled: !!startRFC })
 
   useEffect(() => {
     intentionalCloseRef.current = true
@@ -581,12 +513,9 @@ export default function DashboardPage() {
     intentionalCloseRef.current = false
     setError(null)
 
-    const base =
-      process.env.NEXT_PUBLIC_BACKEND_WS ??
-      `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
-    const url = `${base}/ws/playback?symbols=${encodeURIComponent(selectedSymbol)}&start=${encodeURIComponent(
+    const url = `${baseWs}/ws/playback?symbols=${encodeURIComponent(selectedSymbol)}&start=${encodeURIComponent(
       startRFC ?? "",
-    )}&speed=1&flow=ack&cursor=${encodeURIComponent(String(playbackCursorRef.current))}`
+    )}&speed=${encodeURIComponent(String(playbackSpeedSeconds))}&flow=${encodeURIComponent(playbackFlow)}&cursor=${encodeURIComponent(String(playbackCursorRef.current))}&analyze=true&analysis_window_minutes=300`
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -595,7 +524,6 @@ export default function DashboardPage() {
       if (msg.type === "init") {
         if (typeof msg.cursor === "number") {
           playbackCursorRef.current = msg.cursor
-          setPlaybackCursor(msg.cursor)
         }
         if (msg.symbol === selectedSymbol) {
           barsRef.current = msg.bars || []
@@ -606,9 +534,13 @@ export default function DashboardPage() {
           const firstBar = msg.bars[msg.bars.length - 1]
           if (firstBar && firstBar.t) {
             const barTime = new Date(firstBar.t).getTime()
-            const userTime = new Date(startLocal).getTime()
-            if (Math.abs(barTime - userTime) > 24 * 60 * 60 * 1000) {
-              setError(`No data at exact time. Jumped to nearest: ${new Date(firstBar.t).toLocaleString()}`)
+            const desiredMs = startRFC ? new Date(startRFC).getTime() : null
+            if (typeof desiredMs === "number" && Number.isFinite(desiredMs)) {
+              const diffMs = Math.abs(barTime - desiredMs)
+              if (diffMs > 2 * 60 * 1000) {
+                const diffMin = Math.round(diffMs / (60 * 1000))
+                setError(`No data at exact time. Started at ${new Date(firstBar.t).toLocaleString()} (Δ${diffMin}m)`)
+              }
             }
           }
         }
@@ -618,76 +550,44 @@ export default function DashboardPage() {
       if (msg.type === "bar") {
         const ackI = typeof msg.i === "number" ? msg.i : null
         const nextCursor = ackI != null ? ackI + 1 : null
-        const sessionId = replaySessionIdRef.current
         try {
-        if (msg.symbol === selectedSymbol) {
-          const last = barsRef.current[barsRef.current.length - 1]
-          if (last && String(last?.t ?? "") === String(msg.bar?.t ?? "")) {
-            barsRef.current = [...barsRef.current.slice(0, -1), msg.bar].slice(-1000)
-          } else {
-            barsRef.current = [...barsRef.current, msg.bar].slice(-1000)
-          }
-          setBars(barsRef.current)
-          const barTimeIso = String(msg.bar?.t ?? "")
-          const hasQuantSignal = Boolean(msg.bar?.indicators?.signal)
-          fsmRef.current.lastBarTime = barTimeIso || null
-
-          if (fsmRef.current.state === "IN_POSITION" && barTimeIso) {
-            await runLLMBlocking(() => requestPositionManage(barTimeIso), processMessage)
-            return
-          }
-
-          if (barTimeIso && fsmRef.current.watches.length > 0) {
-            const nowEpoch = toEpochSeconds(barTimeIso)
-            const active = fsmRef.current.watches.filter((w) => nowEpoch < w.expires_at_epoch_s)
-            if (active.length !== fsmRef.current.watches.length) {
-              fsmRef.current.watches = active
+          if (msg.symbol === selectedSymbol) {
+            const hasTrigger = Boolean((msg as any).analysis_trigger_reason)
+            const o = typeof (msg as any)?.bar?.o === "number" ? (msg as any).bar.o : null
+            const c = typeof (msg as any)?.bar?.c === "number" ? (msg as any).bar.c : null
+            const color: "green" | "red" = typeof o === "number" && typeof c === "number" && c >= o ? "green" : "red"
+            const nextBar = hasTrigger ? { ...(msg as any).bar, ui_marker: { kind: "analysis", color } } : msg.bar
+            const last = barsRef.current[barsRef.current.length - 1]
+            if (last && String(last?.t ?? "") === String(msg.bar?.t ?? "")) {
+              barsRef.current = [...barsRef.current.slice(0, -1), nextBar].slice(-1000)
+            } else {
+              barsRef.current = [...barsRef.current, nextBar].slice(-1000)
             }
-
-            if (active.length > 0) {
-              const closePx = Number(msg.bar?.c)
-              const hitWatches = active
-                .filter((w) => {
-                  const cond = w.watch
-                  if (!cond) return false
-                  return cond.direction === "above" ? closePx >= cond.trigger_price : closePx <= cond.trigger_price
-                })
-                .sort((a, b) => a.created_at_epoch_s - b.created_at_epoch_s)
-
-              if (hitWatches.length > 0) {
-                const primary = hitWatches[0]
-                const primaryColor: "green" | "red" = primary.watch.direction === "above" ? "green" : "red"
-                applyBarUIMarker(barTimeIso, { kind: "watch", color: primaryColor })
-                fsmRef.current.watches = active.filter((w) => !hitWatches.includes(w))
-                await runLLMBlocking(() => requestAnalyze(barTimeIso), processMessage)
-                return
-              }
-            }
+            const barTimeIso = String(msg.bar?.t ?? "")
+            setBars(barsRef.current)
+            fsmRef.current.lastBarTime = barTimeIso || null
           }
-
-          if (fsmRef.current.state === "FOLLOW_UP_PENDING" && fsmRef.current.followUp.armed && barTimeIso) {
-            if (!hasQuantSignal) {
-              fsmRef.current.followUp = { armed: false }
-              const up = Number(msg.bar?.c) >= Number(msg.bar?.o)
-              applyBarUIMarker(barTimeIso, { kind: "follow_up", color: up ? "green" : "red" })
-              await runLLMBlocking(() => requestAnalyze(barTimeIso), processMessage)
-            }
-            return
-          }
-        }
         } finally {
           if (nextCursor != null) {
             playbackCursorRef.current = nextCursor
-            setPlaybackCursor(nextCursor)
           }
-          if (
-            ackI != null &&
-            isPlayingRef.current &&
-            sessionId === replaySessionIdRef.current &&
-            wsRef.current &&
-            wsRef.current.readyState === WebSocket.OPEN
-          ) {
-            wsRef.current.send(JSON.stringify({ type: "ack", i: ackI }))
+          if (ackI != null && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            if (ackTimeoutRef.current != null) {
+              try { window.clearTimeout(ackTimeoutRef.current) } catch {}
+              ackTimeoutRef.current = null
+            }
+            const sessionId = replaySessionIdRef.current
+            const delayMs = Math.max(0, Math.round(playbackPaceMs))
+            ackTimeoutRef.current = window.setTimeout(() => {
+              if (
+                isPlayingRef.current &&
+                sessionId === replaySessionIdRef.current &&
+                wsRef.current &&
+                wsRef.current.readyState === WebSocket.OPEN
+              ) {
+                wsRef.current.send(JSON.stringify({ type: "ack", i: ackI }))
+              }
+            }, delayMs)
           }
         }
         return
@@ -695,10 +595,78 @@ export default function DashboardPage() {
 
       if (msg.type === "analysis") {
         if (msg.symbol === selectedSymbol) {
-          if (fsmRef.current.state === "IN_POSITION") return
           const data = msg.result as AnalysisResult
-          appendAIAnalysis(data, data?.timestamp ?? new Date().toISOString())
-          void handleAIResultForFSM(data)
+          appendAIAnalysis(
+            data,
+            data?.timestamp ?? new Date().toISOString(),
+            (msg as any)?.trigger_reason as any,
+          )
+        }
+        return
+      }
+
+      if (msg.type === "state") {
+        if (msg.symbol === selectedSymbol) {
+          setBackendInPosition(Boolean((msg as any).in_position))
+          setBackendContracts({
+            remaining: typeof (msg as any).contracts_remaining === "number" ? (msg as any).contracts_remaining : null,
+            total: typeof (msg as any).contracts_total === "number" ? (msg as any).contracts_total : null,
+          })
+          lastStreamStateRef.current = {
+            contracts_remaining: typeof (msg as any).contracts_remaining === "number" ? (msg as any).contracts_remaining : null,
+            option: (msg as any).option ?? null,
+            option_symbol: (msg as any).option_symbol ?? null,
+          }
+          const next = String((msg as any).state ?? "SCAN")
+          setBackendState(next)
+          if (lastBackendStateRef.current !== next) {
+            lastBackendStateRef.current = next
+            appendSystem(`STATE: ${next}`, new Date().toISOString())
+          }
+        }
+        return
+      }
+
+      if (msg.type === "position") {
+        if (msg.symbol === selectedSymbol) {
+          const data = msg.result as PositionManagementResponse
+          const d = data?.decision
+          const summaryParts = [`POSITION_MGMT: ${d?.action ?? "unknown"}`, String(d?.reasoning ?? "")].filter(Boolean)
+          const optionFromState = lastStreamStateRef.current.option ?? fsmRef.current.trade?.option ?? null
+          const optionSymbolFromState =
+            lastStreamStateRef.current.option_symbol ?? fsmRef.current.trade?.option_symbol ?? null
+          const dirFromState = fsmRef.current.trade?.direction ?? null
+          summaryParts.push(`underlying_symbol=${selectedSymbol}`)
+          if (typeof lastStreamStateRef.current.contracts_remaining === "number") {
+            summaryParts.push(`contracts=${lastStreamStateRef.current.contracts_remaining}`)
+          }
+          if (dirFromState) summaryParts.push(`direction=${dirFromState}`)
+          if (optionFromState) {
+            const right = String((optionFromState as any)?.right ?? "").toUpperCase()
+            const exp = String((optionFromState as any)?.expiration ?? "")
+            const strike = (optionFromState as any)?.strike
+            const strikeStr = typeof strike === "number" ? String(strike) : ""
+            const optLine = [right, exp, strikeStr].filter(Boolean).join(" ")
+            if (optLine) summaryParts.push(`option=${optLine}`)
+            if (!dirFromState && (optionFromState as any)?.right) {
+              const r = String((optionFromState as any).right).toLowerCase()
+              if (r === "call") summaryParts.push("direction=long")
+              else if (r === "put") summaryParts.push("direction=short")
+            }
+          }
+          const optionSymbolFromResponse = (data as any)?.option_symbol
+          const optionSymbolFinal = optionSymbolFromResponse ?? optionSymbolFromState ?? null
+          if (optionSymbolFinal) summaryParts.push(`option_symbol=${optionSymbolFinal}`)
+          const lastBar = barsRef.current[barsRef.current.length - 1]
+          const lastPx = typeof lastBar?.c === "number" ? lastBar.c : null
+          summaryParts.push(`underlying_price=${lastPx ?? "N/A"}`)
+          const optPx = (data as any)?.position_option_quote?.asof_price
+          summaryParts.push(`option_price=${optPx ?? "N/A"}`)
+          if (d?.exit?.contracts_to_close) summaryParts.push(`contracts=${d.exit.contracts_to_close}`)
+          if (d?.adjustments?.new_stop_loss_premium != null) summaryParts.push(`stop_loss=${d.adjustments.new_stop_loss_premium}`)
+          if (d?.adjustments?.new_take_profit_premium != null) summaryParts.push(`take_profit=${d.adjustments.new_take_profit_premium}`)
+          if (d?.adjustments?.new_time_stop_minutes != null) summaryParts.push(`time_stop_minutes=${d.adjustments.new_time_stop_minutes}`)
+          appendAIText(summaryParts.join("\n"), data?.timestamp ?? data?.bar_time ?? new Date().toISOString())
         }
         return
       }
@@ -754,16 +722,19 @@ export default function DashboardPage() {
 
     return () => {
       intentionalCloseRef.current = true
+      if (ackTimeoutRef.current != null) {
+        try { window.clearTimeout(ackTimeoutRef.current) } catch {}
+        ackTimeoutRef.current = null
+      }
       ws.close()
     }
-  }, [isPlaying, selectedSymbol, startRFC, wsToken])
+  }, [isPlaying, selectedSymbol, startRFC, playbackFlow, playbackPaceMs, playbackSpeedSeconds, baseWs])
 
   // Reset handler
   const handleReset = () => {
     stopReplay()
     setBars([])
     playbackCursorRef.current = 0
-    setPlaybackCursor(0)
     setError(null)
     setResetToken(prev => prev + 1)
   }
@@ -776,147 +747,93 @@ export default function DashboardPage() {
   }
 
   return (
-    <main className="flex h-screen flex-col bg-neon-radial text-white font-sans overflow-hidden">
-      {/* Top Control Bar */}
-      <div className="flex-none border-b border-white/10 bg-black/20 backdrop-blur-xl px-6 py-4">
-        <div className="mx-auto flex max-w-[1600px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          
-          {/* Left: Ticker & Status */}
-          <div className="flex items-center gap-6">
-             <div className="relative">
-                <select 
-                  value={selectedSymbol}
-                  onChange={(e) => handleSymbolChange(e.target.value)}
-                  className="appearance-none rounded-xl bg-white/10 pl-4 pr-10 py-2.5 text-sm font-bold text-white hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 transition-colors cursor-pointer"
-                >
-                  {symbolOptions.map(s => <option key={s} value={s} className="bg-slate-900">{s}</option>)}
-                </select>
-                <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-white/50">
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </div>
-             </div>
-
-             <div className="h-8 w-px bg-white/10 hidden lg:block" />
-
-             <div className="flex items-center gap-3">
-               <div className="text-xs font-medium text-white/50 uppercase tracking-wider">Status</div>
-               {isPlaying ? (
-                 <div className="flex items-center gap-2 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-bold text-emerald-400 ring-1 ring-emerald-500/20">
-                   <span className="relative flex h-2 w-2">
-                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                   </span>
-                   LIVE REPLAY
-                 </div>
-               ) : (
-                 <div className="flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-bold text-white/40 ring-1 ring-white/10">
-                   <div className="h-2 w-2 rounded-full bg-white/20" />
-                   PAUSED
-                 </div>
-               )}
-             </div>
+    <TickerConsole
+      symbol={selectedSymbol}
+      bars={bars}
+      prevClose={prevClose}
+      chartStatus={isPlaying ? "hot" : "normal"}
+      aiMessages={aiMessages}
+      headerLeft={
+        <div className="flex items-center gap-6">
+          <div className="relative">
+            <select
+              value={selectedSymbol}
+              onChange={(e) => handleSymbolChange(e.target.value)}
+              className="appearance-none rounded-xl bg-white/10 pl-4 pr-10 py-2.5 text-sm font-bold text-white hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 transition-colors cursor-pointer"
+            >
+              {symbolOptions.map((s) => (
+                <option key={s} value={s} className="bg-slate-900">
+                  {s}
+                </option>
+              ))}
+            </select>
+            <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-white/50">
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
           </div>
 
-          {/* Right: Controls */}
-          <div className="flex flex-wrap items-center gap-4">
-             {/* Time Selector */}
-             <div className="flex items-center gap-3 rounded-xl bg-black/40 px-4 py-2 ring-1 ring-white/10">
-               <span className="text-xs font-bold text-white/40 uppercase">Start Time (PST)</span>
-               <input
-                 type="datetime-local"
-                 value={startLocal}
-                 onChange={(e) => {
-                   setStartLocal(e.target.value)
-                   handleReset()
-                 }}
-                 className="bg-transparent text-sm font-mono font-medium text-white outline-none focus:text-cyan-300 [&::-webkit-calendar-picker-indicator]:invert [&::-webkit-calendar-picker-indicator]:opacity-50 hover:[&::-webkit-calendar-picker-indicator]:opacity-100"
-               />
-             </div>
+          <div className="h-8 w-px bg-white/10 hidden lg:block" />
 
-             {/* Action Buttons */}
-             <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    const next = !isPlaying
-                    userPausedRef.current = !next
-                    if (next) startReplay()
-                    else stopReplay()
-                  }}
-                  className={`flex items-center gap-2 rounded-xl px-6 py-2.5 text-sm font-bold transition-all ${
-                    isPlaying 
-                      ? "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/50 hover:bg-amber-500/30" 
-                      : "bg-white text-black hover:bg-cyan-50 hover:shadow-[0_0_20px_rgba(34,211,238,0.4)]"
-                  }`}
-                >
-                  {isPlaying ? (
-                    <>
-                      <svg className="h-4 w-4 fill-current" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
-                      Pause
-                    </>
-                  ) : (
-                    <>
-                      <svg className="h-4 w-4 fill-current" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                      Start Replay
-                    </>
-                  )}
-                </button>
-
-                <button
-                  onClick={handleReset}
-                  className="rounded-xl bg-white/5 p-2.5 text-white/70 ring-1 ring-white/10 hover:bg-white/10 hover:text-white transition-colors"
-                  title="Reset"
-                >
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </button>
-             </div>
+          <div className="flex items-center gap-3">
+            <div className="text-xs font-medium text-white/50 uppercase tracking-wider">Status</div>
+            {isPlaying ? (
+              <div className="flex items-center gap-2 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-bold text-emerald-400 ring-1 ring-emerald-500/20">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                LIVE REPLAY
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-bold text-white/40 ring-1 ring-white/10">
+                <div className="h-2 w-2 rounded-full bg-white/20" />
+                PAUSED
+              </div>
+            )}
           </div>
 
+          <div className="flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-bold text-white/70 ring-1 ring-white/10">
+            <div className={`h-2 w-2 rounded-full ${backendInPosition ? "bg-emerald-400" : "bg-white/30"}`} />
+            {backendState}
+            {backendInPosition ? ` (${backendContracts.remaining ?? "?"}/${backendContracts.total ?? "?"})` : ""}
+          </div>
         </div>
-      </div>
-
-      {/* Main Workspace */}
-      <div className="flex-1 overflow-hidden p-6">
-        <div className="mx-auto flex h-full max-w-[1600px] gap-6">
-          
-          {/* Left: Market View (Chart) */}
-          <div className="flex-[2] min-w-0 flex flex-col gap-4">
-             {/* Chart Container */}
-             <div className="relative flex-1 rounded-3xl bg-black/40 shadow-neo ring-1 ring-white/10 backdrop-blur-md overflow-hidden p-1">
-                <CandleCard 
-                   symbol={selectedSymbol} 
-                   bars={bars} 
-                   prevClose={prevClose}
-                   className="h-full w-full !bg-transparent !shadow-none !ring-0 !backdrop-blur-none" 
-                   status={isPlaying ? "hot" : "normal"}
-                   onAnalyze={requestAnalyze}
-                />
-                
-                {/* Overlay Info (optional) */}
-                
-             </div>
-             
-             {/* Error Toast */}
-             {error && (
-               <div className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-200 ring-1 ring-red-500/20 flex items-center gap-3 animate-in fade-in slide-in-from-bottom-2">
-                 <svg className="h-5 w-5 flex-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                 </svg>
-                 {error}
-               </div>
-             )}
+      }
+      headerRight={
+        <TransportControls
+          mode="playback"
+          startLocal={startLocal}
+          onStartLocalChange={(v) => {
+            setStartLocal(v)
+            handleReset()
+          }}
+          isPlaying={isPlaying}
+          onTogglePlay={() => {
+            const next = !isPlaying
+            userPausedRef.current = !next
+            if (next) startReplay()
+            else stopReplay()
+          }}
+          onReset={handleReset}
+        />
+      }
+      notice={
+        error ? (
+          <div className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-200 ring-1 ring-red-500/20 flex items-center gap-3 animate-in fade-in slide-in-from-bottom-2">
+            <svg className="h-5 w-5 flex-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+              />
+            </svg>
+            {error}
           </div>
-
-          {/* Right: AI Copilot */}
-          <div className="flex-1 min-w-[320px] hidden lg:block">
-            <AICopilotPanel symbol={selectedSymbol} messages={aiMessages} />
-          </div>
-
-        </div>
-      </div>
-    </main>
+        ) : null
+      }
+    />
   )
 }

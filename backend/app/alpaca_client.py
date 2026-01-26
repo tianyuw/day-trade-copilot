@@ -252,6 +252,7 @@ class AlpacaClient:
     async def get_option_contracts(
         self,
         underlying_symbols: list[str],
+        status: str | None = None,
         expiration_date_lte: str | None = None,
         expiration_date_gte: str | None = None,
         limit: int = 100,
@@ -259,6 +260,10 @@ class AlpacaClient:
     ) -> dict:
         underlyings = [s.strip().upper() for s in underlying_symbols if s.strip()]
         params: dict[str, str] = {"underlying_symbols": ",".join(underlyings), "limit": str(limit)}
+        if status:
+            q_status = str(status).strip().lower()
+            if q_status in {"active", "inactive"}:
+                params["status"] = q_status
         if expiration_date_lte:
             params["expiration_date_lte"] = expiration_date_lte
         if expiration_date_gte:

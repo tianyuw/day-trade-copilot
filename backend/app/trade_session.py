@@ -164,7 +164,9 @@ class SymbolSession:
             adj = d.get("adjustments") if isinstance(d.get("adjustments"), dict) else None
             if isinstance(adj, dict) and adj.get("new_time_stop_minutes") is not None:
                 try:
-                    self.trade.risk["time_stop_minutes"] = int(adj.get("new_time_stop_minutes"))
+                    old_total = int(self.trade.risk.get("time_stop_minutes") or 0)
+                    delta = int(adj.get("new_time_stop_minutes"))
+                    self.trade.risk["time_stop_minutes"] = max(0, old_total) + max(0, delta)
                 except Exception:
                     pass
 

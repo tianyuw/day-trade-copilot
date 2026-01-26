@@ -17,10 +17,14 @@ class AlpacaBar(BaseModel):
     indicators: dict[str, Any] | None = None
 
 
+TriggerReason = Literal["quant_signal", "follow_up", "watch_condition", "position_management"]
+
+
 class StreamBarMessage(BaseModel):
     type: Literal["bar"]
     mode: Literal["realtime", "playback"]
     symbol: str
+    analysis_trigger_reason: TriggerReason | None = None
     bar: AlpacaBar
     i: int | None = None
 
@@ -42,6 +46,7 @@ class StreamAnalysisMessage(BaseModel):
     type: Literal["analysis"]
     mode: Literal["realtime", "playback"]
     symbol: str
+    trigger_reason: TriggerReason | None = None
     result: LLMAnalysisResponse
 
 
@@ -62,6 +67,7 @@ class StreamPositionMessage(BaseModel):
     type: Literal["position"]
     mode: Literal["realtime", "playback"]
     symbol: str
+    trigger_reason: TriggerReason | None = None
     result: "PositionManagementResponse"
 
 
@@ -97,6 +103,7 @@ class TradePlan(BaseModel):
     contracts: int
     risk: TradePlanRisk
     take_profit_premium: float
+    option_symbol: str | None = None
 
 class LLMAnalysisResponse(BaseModel):
     analysis_id: str
@@ -223,3 +230,4 @@ class PositionManagementResponse(BaseModel):
     bar_time: str
     decision: PositionDecision
     position_option_quote: dict[str, Any] | None = None
+    option_symbol: str | None = None

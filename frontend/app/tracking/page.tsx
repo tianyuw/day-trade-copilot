@@ -1,26 +1,26 @@
 "use client"
 
 import Link from "next/link"
-import { useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { motion } from "framer-motion"
+import { Clock } from "lucide-react"
 import { TrackingMiniChart } from "../../components/TrackingMiniChart"
 import { cn } from "../../components/cn"
 
 type StreamInit = {
   type: "init"
-  mode: "realtime" | "playback"
+  mode: "realtime"
   symbol: string
   bars: any[]
   cursor?: number
 }
-type StreamBar = { type: "bar"; mode: "realtime" | "playback"; symbol: string; bar: any; i?: number }
-type StreamAnalysis = { type: "analysis"; mode: "realtime" | "playback"; symbol: string; result: any }
-type StreamDone = { type: "done"; mode: "realtime" | "playback"; cursor?: number }
+type StreamBar = { type: "bar"; mode: "realtime"; symbol: string; bar: any; i?: number }
+type StreamAnalysis = { type: "analysis"; mode: "realtime"; symbol: string; trigger_reason?: any; result: any }
+type StreamDone = { type: "done"; mode: "realtime"; cursor?: number }
 type StreamError = { type: "error"; message: string }
 type StreamState = {
   type: "state"
-  mode: "realtime" | "playback"
+  mode: "realtime"
   symbol: string
   state: string
   in_position: boolean
@@ -30,7 +30,7 @@ type StreamState = {
   option?: { right: "call" | "put"; expiration: string; strike: number } | null
   option_symbol?: string | null
 }
-type StreamPosition = { type: "position"; mode: "realtime" | "playback"; symbol: string; result: any }
+type StreamPosition = { type: "position"; mode: "realtime"; symbol: string; trigger_reason?: any; result: any }
 type StreamMessage = StreamInit | StreamBar | StreamAnalysis | StreamState | StreamPosition | StreamDone | StreamError
 
 type MarketStatus = {
@@ -59,7 +59,6 @@ type SymbolSuggestion = { symbol: string; name?: string; exchange?: string }
 
 const DEFAULT_WATCHLIST = ["META", "NVDA", "TSM", "PLTR", "AAPL", "NFLX", "SPY", "QQQ"]
 const WATCHLIST_STORAGE_KEY = "tracking:watchlist"
-const DEV_PLAYBACK_START_UTC = "2026-01-23T14:30:00Z"
 
 function formatCountdown(ms: number): string {
   const clamped = Math.max(0, ms)
@@ -162,11 +161,8 @@ export default function TrackingPage() {
   const pressTimerRef = useRef<number | null>(null)
   const suppressNextClickRef = useRef(false)
 
-  const searchParams = useSearchParams()
-  const isDev = searchParams.get("dev") === "true"
-
   const symbolsParam = useMemo(() => watchlist.join(","), [watchlist])
-  const isOffHours = useMemo(() => !isDev && !!market && market.session !== "regular", [isDev, market])
+  const isOffHours = useMemo(() => !!market && market.session !== "regular", [market])
 
   const [bannerNowMs, setBannerNowMs] = useState(() => Date.now())
   useEffect(() => {
@@ -438,12 +434,7 @@ export default function TrackingPage() {
       process.env.NEXT_PUBLIC_BACKEND_WS ??
       `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_BACKEND_WS_PORT ?? "8000"}`
     
-    let url = ""
-    if (isDev) {
-      url = `${base}/ws/playback?symbols=${encodeURIComponent(symbolsParam)}&start=${encodeURIComponent(DEV_PLAYBACK_START_UTC)}&speed=1.0&flow=timer`
-    } else {
-      url = `${base}/ws/realtime?symbols=${encodeURIComponent(symbolsParam)}&analyze=true`
-    }
+    const url = `${base}/ws/realtime?symbols=${encodeURIComponent(symbolsParam)}&analyze=true`
 
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -495,7 +486,7 @@ export default function TrackingPage() {
       intentionalCloseRef.current = true
       ws.close()
     }
-  }, [isDev, isOffHours, symbolsParam, watchlist.length])
+  }, [isOffHours, symbolsParam, watchlist.length])
 
   const sortedSymbols = useMemo(() => {
     const inPos: string[] = []
@@ -561,12 +552,6 @@ export default function TrackingPage() {
                 <span className={cn("h-2 w-2 rounded-full", market?.session === "regular" ? "bg-emerald-400" : market?.session === "closed" ? "bg-white/30" : "bg-cyan-400")} />
                 {market ? marketLabel(market.session) : "Unknown"}
               </div>
-              {isDev && (
-                <div className="flex items-center gap-2 rounded-full bg-amber-500/10 px-3 py-1 text-xs font-bold text-amber-300 ring-1 ring-amber-500/30">
-                  <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
-                  DEV REPLAY (1x)
-                </div>
-              )}
               {countdown && (
                 <div className="hidden sm:flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs font-mono text-white/60 ring-1 ring-white/10">
                   <span className="text-white/40">{countdown.label}</span>
@@ -584,7 +569,7 @@ export default function TrackingPage() {
                   wsStatus === "open" ? "bg-emerald-400" : wsStatus === "connecting" ? "bg-cyan-400" : wsStatus === "error" ? "bg-red-400" : "bg-white/30",
                 )}
               />
-              {wsStatus === "open" ? (isDev ? "Replaying" : "AI Monitoring") : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
+              {wsStatus === "open" ? "AI Monitoring" : wsStatus === "connecting" ? "Connecting" : wsStatus === "error" ? "Error" : "Disconnected"}
             </div>
           </div>
         </div>
@@ -592,16 +577,25 @@ export default function TrackingPage() {
 
         {isOffHours && market && (
           <div className="px-6 pb-4">
-            <div className="mx-auto max-w-[1600px] rounded-xl bg-amber-500/10 px-4 py-3 text-amber-200 ring-1 ring-amber-500/30">
-              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-                <div className="text-sm font-bold">
-                  {offHoursLabel(market.session)} · Next RTH Open{" "}
-                  <span className="font-mono text-amber-200/80">
-                    {formatInTz(market.next_open, "America/New_York")} ET / {formatInTz(market.next_open, "America/Los_Angeles")} PT
-                  </span>
-                </div>
-                <div className="text-xs font-mono text-amber-200/80" aria-live="polite">
-                  Next RTH opens in {formatCountdownDhM(Date.parse(market.next_open) - bannerNowMs)}
+            <div className="mx-auto max-w-[1600px]">
+              <div className="relative overflow-hidden rounded-2xl border border-amber-500/25 bg-gradient-to-br from-amber-500/15 via-black/30 to-black/10 px-5 py-4 text-amber-100 shadow-[0_0_0_1px_rgba(245,158,11,0.10),0_16px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl">
+                <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(900px_circle_at_12%_-20%,rgba(245,158,11,0.28),transparent_55%)]" />
+                <div className="relative flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-amber-100">Market is closed.</div>
+                    <div className="mt-1 text-xs text-amber-200/70">
+                      Come back during regular trading hours for realtime monitoring, or watch replay instead.
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3 sm:justify-end">
+                    <Link
+                      href="/dashboard"
+                      className="rounded-xl bg-amber-200 px-4 py-2 text-sm font-bold text-black hover:bg-amber-100"
+                    >
+                      Open Replay Dashboard
+                    </Link>
+                  </div>
                 </div>
               </div>
             </div>
@@ -746,11 +740,11 @@ export default function TrackingPage() {
                     </div>
 
                     <div className="relative mt-3">
-                      {isOffHours && <div className="absolute right-2 top-2 z-10 text-[10px] font-bold text-white/35">Prev Session · 5m</div>}
                       <TrackingMiniChart
                         bars={bars}
                         windowMinutes={isOffHours ? 390 : 120}
-                        anchorTimeRfc3339={isDev ? DEV_PLAYBACK_START_UTC : isOffHours ? market?.last_rth_close : undefined}
+                        bucketMinutes={isOffHours ? 5 : 1}
+                        anchorTimeRfc3339={isOffHours ? market?.last_rth_close : undefined}
                       />
                     </div>
                   </div>
