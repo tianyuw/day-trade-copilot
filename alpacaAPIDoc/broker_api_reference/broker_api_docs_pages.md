@@ -1,0 +1,62 @@
+# Alpaca Broker API Docs（快照目录）
+
+此文件列出本目录下抓取的 `docs.alpaca.markets/docs/*` 页面快照。
+
+| Doc | Source | Local |
+|---|---|---|
+| /docs/245-trading | [/docs/245-trading](https://docs.alpaca.markets/docs/245-trading) | broker_api_reference/docs/245-trading.md |
+| /docs/5f36ea05-b1b4-5fd1-91b5-ef51db361a4b | [/docs/5f36ea05-b1b4-5fd1-91b5-ef51db361a4b](https://docs.alpaca.markets/docs/5f36ea05-b1b4-5fd1-91b5-ef51db361a4b) | broker_api_reference/docs/5f36ea05-b1b4-5fd1-91b5-ef51db361a4b.md |
+| /docs/about-alpaca | [/docs/about-alpaca](https://docs.alpaca.markets/docs/about-alpaca) | broker_api_reference/docs/about-alpaca.md |
+| /docs/about-broker-api | [/docs/about-broker-api](https://docs.alpaca.markets/docs/about-broker-api) | broker_api_reference/docs/about-broker-api.md |
+| /docs/about-connect-api | [/docs/about-connect-api](https://docs.alpaca.markets/docs/about-connect-api) | broker_api_reference/docs/about-connect-api.md |
+| /docs/account-activities | [/docs/account-activities](https://docs.alpaca.markets/docs/account-activities) | broker_api_reference/docs/account-activities.md |
+| /docs/account-opening | [/docs/account-opening](https://docs.alpaca.markets/docs/account-opening) | broker_api_reference/docs/account-opening.md |
+| /docs/account-plans | [/docs/account-plans](https://docs.alpaca.markets/docs/account-plans) | broker_api_reference/docs/account-plans.md |
+| /docs/account-status-events-for-kycaas | [/docs/account-status-events-for-kycaas](https://docs.alpaca.markets/docs/account-status-events-for-kycaas) | broker_api_reference/docs/account-status-events-for-kycaas.md |
+| /docs/accounts-statuses | [/docs/accounts-statuses](https://docs.alpaca.markets/docs/accounts-statuses) | broker_api_reference/docs/accounts-statuses.md |
+| /docs/ach-funding | [/docs/ach-funding](https://docs.alpaca.markets/docs/ach-funding) | broker_api_reference/docs/ach-funding.md |
+| /docs/additional-resources | [/docs/additional-resources](https://docs.alpaca.markets/docs/additional-resources) | broker_api_reference/docs/additional-resources.md |
+| /docs/alpaca-api-platform | [/docs/alpaca-api-platform](https://docs.alpaca.markets/docs/alpaca-api-platform) | broker_api_reference/docs/alpaca-api-platform.md |
+| /docs/alpaca-elite-smart-router | [/docs/alpaca-elite-smart-router](https://docs.alpaca.markets/docs/alpaca-elite-smart-router) | broker_api_reference/docs/alpaca-elite-smart-router.md |
+| /docs/alpaca-mcp-server | [/docs/alpaca-mcp-server](https://docs.alpaca.markets/docs/alpaca-mcp-server) | broker_api_reference/docs/alpaca-mcp-server.md |
+| /docs/authentication | [/docs/authentication](https://docs.alpaca.markets/docs/authentication) | broker_api_reference/docs/authentication.md |
+| /docs/broker-api-faq | [/docs/broker-api-faq](https://docs.alpaca.markets/docs/broker-api-faq) | broker_api_reference/docs/broker-api-faq.md |
+| /docs/brokerapi-trading | [/docs/brokerapi-trading](https://docs.alpaca.markets/docs/brokerapi-trading) | broker_api_reference/docs/brokerapi-trading.md |
+| /docs/credential-management | [/docs/credential-management](https://docs.alpaca.markets/docs/credential-management) | broker_api_reference/docs/credential-management.md |
+| /docs/custodial-accounts | [/docs/custodial-accounts](https://docs.alpaca.markets/docs/custodial-accounts) | broker_api_reference/docs/custodial-accounts.md |
+| /docs/daily-processes-and-reconcilations | [/docs/daily-processes-and-reconcilations](https://docs.alpaca.markets/docs/daily-processes-and-reconcilations) | broker_api_reference/docs/daily-processes-and-reconcilations.md |
+| /docs/data-validations | [/docs/data-validations](https://docs.alpaca.markets/docs/data-validations) | broker_api_reference/docs/data-validations.md |
+| /docs/domestic-usa-accounts | [/docs/domestic-usa-accounts](https://docs.alpaca.markets/docs/domestic-usa-accounts) | broker_api_reference/docs/domestic-usa-accounts.md |
+| /docs/example-trading-app-ribbit | [/docs/example-trading-app-ribbit](https://docs.alpaca.markets/docs/example-trading-app-ribbit) | broker_api_reference/docs/example-trading-app-ribbit.md |
+| /docs/fdic-sweep-program | [/docs/fdic-sweep-program](https://docs.alpaca.markets/docs/fdic-sweep-program) | broker_api_reference/docs/fdic-sweep-program.md |
+| /docs/fix-messages | [/docs/fix-messages](https://docs.alpaca.markets/docs/fix-messages) | broker_api_reference/docs/fix-messages.md |
+| /docs/fixed-income | [/docs/fixed-income](https://docs.alpaca.markets/docs/fixed-income) | broker_api_reference/docs/fixed-income.md |
+| /docs/fixed-income-1 | [/docs/fixed-income-1](https://docs.alpaca.markets/docs/fixed-income-1) | broker_api_reference/docs/fixed-income-1.md |
+| /docs/fractional-trading | [/docs/fractional-trading](https://docs.alpaca.markets/docs/fractional-trading) | broker_api_reference/docs/fractional-trading.md |
+| /docs/fully-paid-securities-lending | [/docs/fully-paid-securities-lending](https://docs.alpaca.markets/docs/fully-paid-securities-lending) | broker_api_reference/docs/fully-paid-securities-lending.md |
+| /docs/funding-accounts | [/docs/funding-accounts](https://docs.alpaca.markets/docs/funding-accounts) | broker_api_reference/docs/funding-accounts.md |
+| /docs/funding-via-journals | [/docs/funding-via-journals](https://docs.alpaca.markets/docs/funding-via-journals) | broker_api_reference/docs/funding-via-journals.md |
+| /docs/funding-wallets | [/docs/funding-wallets](https://docs.alpaca.markets/docs/funding-wallets) | broker_api_reference/docs/funding-wallets.md |
+| /docs/getting-started | [/docs/getting-started](https://docs.alpaca.markets/docs/getting-started) | broker_api_reference/docs/getting-started.md |
+| /docs/getting-started-with-broker-api | [/docs/getting-started-with-broker-api](https://docs.alpaca.markets/docs/getting-started-with-broker-api) | broker_api_reference/docs/getting-started-with-broker-api.md |
+| /docs/holiday-funding-processes | [/docs/holiday-funding-processes](https://docs.alpaca.markets/docs/holiday-funding-processes) | broker_api_reference/docs/holiday-funding-processes.md |
+| /docs/instant-funding | [/docs/instant-funding](https://docs.alpaca.markets/docs/instant-funding) | broker_api_reference/docs/instant-funding.md |
+| /docs/instant-funding-1 | [/docs/instant-funding-1](https://docs.alpaca.markets/docs/instant-funding-1) | broker_api_reference/docs/instant-funding-1.md |
+| /docs/integration-setup-with-alpaca | [/docs/integration-setup-with-alpaca](https://docs.alpaca.markets/docs/integration-setup-with-alpaca) | broker_api_reference/docs/integration-setup-with-alpaca.md |
+| /docs/international-accounts | [/docs/international-accounts](https://docs.alpaca.markets/docs/international-accounts) | broker_api_reference/docs/international-accounts.md |
+| /docs/ira-accounts-overview | [/docs/ira-accounts-overview](https://docs.alpaca.markets/docs/ira-accounts-overview) | broker_api_reference/docs/ira-accounts-overview.md |
+| /docs/local-currency-trading-lct | [/docs/local-currency-trading-lct](https://docs.alpaca.markets/docs/local-currency-trading-lct) | broker_api_reference/docs/local-currency-trading-lct.md |
+| /docs/mandatory-corporate-actions | [/docs/mandatory-corporate-actions](https://docs.alpaca.markets/docs/mandatory-corporate-actions) | broker_api_reference/docs/mandatory-corporate-actions.md |
+| /docs/margin-and-short-selling | [/docs/margin-and-short-selling](https://docs.alpaca.markets/docs/margin-and-short-selling) | broker_api_reference/docs/margin-and-short-selling.md |
+| /docs/non-trade-activities-for-option-events | [/docs/non-trade-activities-for-option-events](https://docs.alpaca.markets/docs/non-trade-activities-for-option-events) | broker_api_reference/docs/non-trade-activities-for-option-events.md |
+| /docs/omnisub | [/docs/omnisub](https://docs.alpaca.markets/docs/omnisub) | broker_api_reference/docs/omnisub.md |
+| /docs/orders-at-alpaca | [/docs/orders-at-alpaca](https://docs.alpaca.markets/docs/orders-at-alpaca) | broker_api_reference/docs/orders-at-alpaca.md |
+| /docs/paper-trading | [/docs/paper-trading](https://docs.alpaca.markets/docs/paper-trading) | broker_api_reference/docs/paper-trading.md |
+| /docs/portfolio-rebalancing | [/docs/portfolio-rebalancing](https://docs.alpaca.markets/docs/portfolio-rebalancing) | broker_api_reference/docs/portfolio-rebalancing.md |
+| /docs/position-average-entry-price-calculation | [/docs/position-average-entry-price-calculation](https://docs.alpaca.markets/docs/position-average-entry-price-calculation) | broker_api_reference/docs/position-average-entry-price-calculation.md |
+| /docs/registering-your-app | [/docs/registering-your-app](https://docs.alpaca.markets/docs/registering-your-app) | broker_api_reference/docs/registering-your-app.md |
+| /docs/regulatory-fees | [/docs/regulatory-fees](https://docs.alpaca.markets/docs/regulatory-fees) | broker_api_reference/docs/regulatory-fees.md |
+| /docs/sdks-and-tools | [/docs/sdks-and-tools](https://docs.alpaca.markets/docs/sdks-and-tools) | broker_api_reference/docs/sdks-and-tools.md |
+| /docs/sse-events | [/docs/sse-events](https://docs.alpaca.markets/docs/sse-events) | broker_api_reference/docs/sse-events.md |
+| /docs/statements-and-confirms | [/docs/statements-and-confirms](https://docs.alpaca.markets/docs/statements-and-confirms) | broker_api_reference/docs/statements-and-confirms.md |
+| /docs/tokenization-guide-for-authorized-participant | [/docs/tokenization-guide-for-authorized-participant](https://docs.alpaca.markets/docs/tokenization-guide-for-authorized-participant) | broker_api_reference/docs/tokenization-guide-for-authorized-participant.md |

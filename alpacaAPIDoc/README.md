@@ -50,3 +50,21 @@
 ```bash
 ./backend/.venv/bin/python alpacaAPIDoc/scrape_websocket_stream_api.py
 ```
+
+## Broker API
+
+运行脚本会生成/刷新以下文件：
+
+- `broker_api_reference/broker_openapi.yaml`：Broker API 的 OpenAPI 规范（来自 `alpacahq/alpaca-docs`）
+- `broker_api_reference/broker_openapi_reference_index.md`：从 OpenAPI 提取的端点索引（按 tag 分组，带 Reference 链接）
+- `broker_api_reference/broker_api_overview.md`：Broker API 概览页文本快照（source: `/docs/about-broker-api`）
+- `broker_api_reference/broker_api_docs_pages.md`：Broker API 文档子页面快照目录
+- `broker_api_reference/broker_api_reference_pages.md`：Reference 页面快照目录（slug → 本地文件）
+- `broker_api_reference/reference/*.md`：抓取的 `docs.alpaca.markets/reference/{slug}.md`
+- `broker_api_reference/docs/*.md`：抓取的 `docs.alpaca.markets/docs/*`（Broker API 相关）
+
+生成方式（使用后端虚拟环境）：
+
+```bash
+./backend/.venv/bin/python alpacaAPIDoc/scrape_broker_api.py
+```

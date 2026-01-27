@@ -1,0 +1,393 @@
+---
+source_view: https://docs.alpaca.markets/reference/get-v1-trading-accounts-account_id-account-portfolio-history
+source_md: https://docs.alpaca.markets/reference/get-v1-trading-accounts-account_id-account-portfolio-history.md
+scraped_at_utc: 2026-01-27T04:30:48Z
+---
+# Get Account Portfolio History
+
+Returns timeseries data about equity and profit/loss (P/L) of the account in requested timespan.
+
+# OpenAPI definition
+
+```json
+{
+  "openapi": "3.0.0",
+  "x-stoplight": {
+    "id": "y5xqkgq9w6jde"
+  },
+  "info": {
+    "title": "Broker API",
+    "description": "Open brokerage accounts, enable stock, options and crypto trading. Manage the ongoing user experience and brokerage customer lifecycle with the Alpaca Broker API",
+    "version": "1.1.1",
+    "contact": {
+      "name": "Alpaca Support",
+      "email": "support@alpaca.markets",
+      "url": "https://alpaca.markets/support"
+    },
+    "termsOfService": "https://s3.amazonaws.com/files.alpaca.markets/disclosures/library/TermsAndConditions.pdf"
+  },
+  "servers": [
+    {
+      "url": "https://broker-api.sandbox.alpaca.markets",
+      "description": "Sandbox endpoint"
+    },
+    {
+      "url": "https://broker-api.alpaca.markets",
+      "description": "Production endpoint"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Portfolio History"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BasicAuth": {
+        "type": "http",
+        "scheme": "basic"
+      }
+    }
+  },
+  "paths": {
+    "/v1/trading/accounts/{account_id}/account/portfolio/history": {
+      "get": {
+        "tags": [
+          "Portfolio History"
+        ],
+        "summary": "Get Account Portfolio History",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "name": "account_id",
+            "in": "path",
+            "required": true
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "period",
+            "description": "The duration of the data in `number` + `unit` format, such as 1D, where `unit` can be D for day, W for week, M for month and A for year. Defaults to 1M.\n\nOnly two of `start`, `end` and `period` can be specified at the same time.\n\nFor intraday timeframes (\\<1D) only 30 days or less can be queried, for 1D resolutions there is no such limit, data is available since the\ncreation of the account.\n"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "timeframe",
+            "description": "The resolution of time window. 1Min, 5Min, 15Min, 1H, or 1D. If omitted, 1Min for less than 7 days period,\n15Min for less than 30 days, or otherwise 1D.\n\nFor queries with longer than 30 days of `period`, the system only accepts 1D as `timeframe`.\n"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "market_hours",
+                "extended_hours",
+                "continuous"
+              ],
+              "default": "market_hours"
+            },
+            "in": "query",
+            "name": "intraday_reporting",
+            "description": "For intraday resolutions (<1D) this specfies which timestamps to return data points for:\n\nAllowed values are:\n- **market_hours**\n\n  Only timestamps for the core requity trading hours are returned (usually 9:30am to 4:00pm, trading days only)\n\n- **extended_hours**\n\n  Returns timestamps for the whole session including extended hours (usually 4:00am to 8:00pm, trading days only)\n\n- **continuous**\n\n  Returns price data points 24/7 (for off-session times too). To calculate the equity values we are using the following prices:\n\n  Between 4:00am and 10:00pm on trading days the valuation will be calculated based on the last trade (extended hours and normal hours respectively).\n\n  After 10:00pm, until the next session open the equities will be valued at their official closing price on the primary exchange.\n"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "example": "2021-03-16T18:38:01Z"
+            },
+            "in": "query",
+            "name": "start",
+            "description": "The timestamp the data is returned starting from in RFC3339 format (including timezone specification). Defaults to `end` minus `period`\n\nIf provided, the `start` value is always normalized to the `America/New_York` timezone and adjusted to the nearest `timeframe` interval, e.g. seconds are always truncated and the time is rounded backwards to the nearest ineterval of `1Min`, `5Min`, `15Min`, or `1H`.\n\nIf `timeframe=1D` and `start` is not a valid trading date, find the next available trading date. For example, if `start` occurs on Saturday or Sunday after converting to the America/New_York timezone, `start` is adjusted to the first weekday that is not a market holiday (e.g. Monday).\n\nIf `timeframe` is less than `1D` and `intraday_reporting` is not `continuous`, `start` always reflects the beginning of a market session. If `start` is between midnight and the end (inclusive) of an active trading day, `start` is set to the beginning of the session on the specified day. Otherwise, if `start` occurs outside of the market session, the next avaialble market date is used.\n\nFor example, when `intraday_reporting=market_hours` and `start=2023-10-19T23:59:59-04:00`, the provided `start` date occurs outside of the regular market session. The effective `start` timestamp is adjusted to the beginning of the next session: `2023-10-20T09:30:00-04:00`\n\n`start` may be be combined with one of `end` or `period`.\n\nProviding all of `start`, `end`, and `period` is invalid.\n"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "no_reset",
+                "per_day"
+              ],
+              "default": "per_day"
+            },
+            "in": "query",
+            "name": "pnl_reset",
+            "description": "`pnl_reset` defines how we are calculating the baseline values for Profit And Loss (pnl) for queries with `timeframe` less than 1D (intraday queries).\n\nThe default behavior for intraday queries is that we reset the pnl value to the previous day's closing equity for each **trading** day.\n\nIn case of crypto (given it's continous nature), this might not be desired: specifying \"no_reset\" disables this behavior and all pnl values\nreturned will be relative to the closing equity of the previous trading day.\n\nFor 1D resolution all PnL values are calculated relative to the `base_value`, we are not reseting the base value.\n"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "example": "2021-03-16T18:38:01Z"
+            },
+            "in": "query",
+            "name": "end",
+            "description": "The timestamp the data is returned up to in RFC3339 format (including timezone specification). Defaults to the current time.\n\nIf provided, the `end` value is always normalized to the `America/New_York` timezone and adjusted to the nearest `timeframe` interval, e.g. seconds are always truncated and the time is rounded backwards to the nearest ineterval of `1Min`, `5Min`, `15Min`, or `1H`.\n\nWhen `intraday_reporting` is either `market_hours` or `extended_hours`, the `end` value is adjusted to not occur after session close on the specified day. For example if the `intraday_reporting` is `extended_hours`, and the timestamp specified is `2023-10-19T21:33:00-04:00`, `end` is adjusted to `2023-10-19T20:00:00-04:00`.\n\n`end` may be combined with `start` or `period`.\n\nProviding all of `start`, `end`, and `period` is invalid.\n"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "extended_hours",
+            "description": "**deprecated**: Users are strongly advised to **rely on the `intraday_reporting` query parameter** for better control\nof the reporting range.\n\nIf true, include extended hours in the result. This is effective only for timeframe less than 1D.\n"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "cashflow_types",
+            "description": "The cashflow activities to include in the report. One of 'ALL', 'NONE', or a comma-separated list of activity types."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "PortfolioHistory",
+                  "description": "Timeseries data for equity and profit loss information of the account.",
+                  "type": "object",
+                  "properties": {
+                    "timestamp": {
+                      "type": "array",
+                      "description": "Time of each data element, left-labeled (the beginning of time window).\n\nThe values returned are in [UNIX epoch format](https://en.wikipedia.org/wiki/Unix_time).\n",
+                      "items": {
+                        "type": "integer"
+                      }
+                    },
+                    "equity": {
+                      "type": "array",
+                      "description": "equity value of the account in dollar amount as of the end of each time window",
+                      "items": {
+                        "type": "number"
+                      }
+                    },
+                    "profit_loss": {
+                      "type": "array",
+                      "description": "profit/loss in dollar from the base value",
+                      "items": {
+                        "type": "number"
+                      }
+                    },
+                    "profit_loss_pct": {
+                      "type": "array",
+                      "description": "profit/loss in percentage from the base value",
+                      "items": {
+                        "type": "number"
+                      },
+                      "example": [
+                        0.001,
+                        0.002
+                      ]
+                    },
+                    "base_value": {
+                      "type": "number",
+                      "description": "basis in dollar of the profit loss calculation"
+                    },
+                    "base_value_asof": {
+                      "type": "string",
+                      "format": "date",
+                      "example": "2023-10-20",
+                      "description": "If included, then it indicates that the base_value is the account's closing\nequity value at this trading date.\n\nIf not specified, then the baseline calculation is done against the earliest returned data item. This could happen for\naccounts without prior closing balances (e.g. new account) or for queries with 1D timeframes, where the first data point\nis used as a reference point.\n"
+                    },
+                    "timeframe": {
+                      "type": "string",
+                      "description": "time window size of each data element",
+                      "example": "15Min"
+                    }
+                  },
+                  "required": [
+                    "timestamp",
+                    "equity",
+                    "profit_loss",
+                    "profit_loss_pct",
+                    "base_value",
+                    "timeframe"
+                  ],
+                  "x-examples": {
+                    "example-intraday-query-15min-1d": {
+                      "timestamp": [
+                        1697722200,
+                        1697723100,
+                        1697724000,
+                        1697724900,
+                        1697725800,
+                        1697726700,
+                        1697727600,
+                        1697728500,
+                        1697729400,
+                        1697730300,
+                        1697731200,
+                        1697732100,
+                        1697733000,
+                        1697733900,
+                        1697734800,
+                        1697735700,
+                        1697736600,
+                        1697737500,
+                        1697738400,
+                        1697739300,
+                        1697740200,
+                        1697741100,
+                        1697742000,
+                        1697742900,
+                        1697743800,
+                        1697744700,
+                        1697745600
+                      ],
+                      "equity": [
+                        2773.79,
+                        2769.04,
+                        2768.65,
+                        2765.11,
+                        2763.03,
+                        2763.17,
+                        2763.17,
+                        2763.47,
+                        2763.91,
+                        2768.13,
+                        2774.98,
+                        2757.94,
+                        2757.65,
+                        2774.54,
+                        2775.58,
+                        2775.28,
+                        2767.9,
+                        2762.26,
+                        2762.56,
+                        2756.99,
+                        2756.84,
+                        2752.43,
+                        2752.13,
+                        2748.44,
+                        2751.23,
+                        2747.54,
+                        2748.74
+                      ],
+                      "profit_loss": [
+                        -0.37,
+                        -5.12,
+                        -5.51,
+                        -9.05,
+                        -11.13,
+                        -10.99,
+                        -10.99,
+                        -10.69,
+                        -10.25,
+                        -6.03,
+                        0.82,
+                        -16.22,
+                        -16.51,
+                        0.38,
+                        1.42,
+                        1.12,
+                        -6.26,
+                        -11.9,
+                        -11.6,
+                        -17.17,
+                        -17.32,
+                        -21.73,
+                        -22.03,
+                        -25.72,
+                        -22.93,
+                        -26.62,
+                        -25.42
+                      ],
+                      "profit_loss_pct": [
+                        -0.0001,
+                        -0.0018,
+                        -0.002,
+                        -0.0033,
+                        -0.004,
+                        -0.004,
+                        -0.004,
+                        -0.0039,
+                        -0.0037,
+                        -0.0022,
+                        0.0003,
+                        -0.0058,
+                        -0.006,
+                        0.0001,
+                        0.0005,
+                        0.0004,
+                        -0.0023,
+                        -0.0043,
+                        -0.0042,
+                        -0.0062,
+                        -0.0062,
+                        -0.0078,
+                        -0.0079,
+                        -0.0093,
+                        -0.0083,
+                        -0.0096,
+                        -0.0092
+                      ],
+                      "base_value": 2774.16,
+                      "base_value_asof": "2023-10-18",
+                      "timeframe": "15Min"
+                    },
+                    "example-query-1d-7d": {
+                      "timestamp": [
+                        1697241600,
+                        1697500800,
+                        1697587200,
+                        1697673600,
+                        1697760000
+                      ],
+                      "equity": [
+                        2784.79,
+                        2794.79,
+                        2805.46,
+                        2774.16,
+                        2748.73
+                      ],
+                      "profit_loss": [
+                        0,
+                        10.0022,
+                        10.6692,
+                        -31.2996,
+                        -25.4232
+                      ],
+                      "profit_loss_pct": [
+                        0,
+                        0.0035,
+                        0.0074,
+                        -0.0038,
+                        -0.0129
+                      ],
+                      "base_value": 2784.79,
+                      "timeframe": "1D"
+                    }
+                  },
+                  "x-stoplight": {
+                    "id": "kjmp5ewl4g6k3"
+                  },
+                  "x-readme-ref-name": "PortfolioHistory"
+                }
+              }
+            }
+          }
+        },
+        "operationId": "get-v1-trading-accounts-account_id-account-portfolio-history",
+        "description": "Returns timeseries data about equity and profit/loss (P/L) of the account in requested timespan."
+      }
+    }
+  },
+  "security": [
+    {
+      "BasicAuth": []
+    }
+  ],
+  "x-readme": {
+    "explorer-enabled": true,
+    "proxy-enabled": false
+  }
+}
+```

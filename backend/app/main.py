@@ -644,6 +644,23 @@ def create_app() -> FastAPI:
         execution = require_execution(execution)
         return await alpaca.get_account(execution.value)
 
+    @app.get("/api/trading/portfolio_history")
+    async def trading_portfolio_history(
+        execution: ExecutionMode = Query(default=ExecutionMode.paper),
+        period: str | None = None,
+        timeframe: str | None = None,
+        date_end: str | None = None,
+        extended_hours: bool | None = None,
+    ) -> dict:
+        execution = require_execution(execution)
+        return await alpaca.get_portfolio_history(
+            execution.value,
+            period=period,
+            timeframe=timeframe,
+            date_end=date_end,
+            extended_hours=extended_hours,
+        )
+
     @app.get("/api/trading/positions")
     async def trading_positions(execution: ExecutionMode = Query(default=ExecutionMode.paper)) -> dict:
         execution = require_execution(execution)

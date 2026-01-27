@@ -145,6 +145,30 @@ class AlpacaClient:
             r.raise_for_status()
             return r.json()
 
+    async def get_portfolio_history(
+        self,
+        execution: str = "paper",
+        period: str | None = None,
+        timeframe: str | None = None,
+        date_end: str | None = None,
+        extended_hours: bool | None = None,
+    ) -> dict:
+        base, headers = self._trading_base_and_headers(execution)
+        url = f"{base}/v2/account/portfolio/history"
+        params: dict[str, str] = {}
+        if period:
+            params["period"] = str(period)
+        if timeframe:
+            params["timeframe"] = str(timeframe)
+        if date_end:
+            params["date_end"] = str(date_end)
+        if extended_hours is not None:
+            params["extended_hours"] = "true" if extended_hours else "false"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, headers=headers, params=params or None)
+            r.raise_for_status()
+            return r.json()
+
     async def list_positions(self, execution: str = "paper") -> list[dict]:
         base, headers = self._trading_base_and_headers(execution)
         url = f"{base}/v2/positions"
